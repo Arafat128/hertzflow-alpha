@@ -43,6 +43,7 @@ def run(
     total_supply: int | None,
     primary_chain: str | None = None,
     holder_snapshot_mode: bool = False,
+    supply_split: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Section MULTI-CHAIN entrypoint. v0.6.2: all labels via i18n.
 
@@ -52,12 +53,28 @@ def run(
     battlefield. The old `chain_label == "BSC"` test always read True and
     reported "单链 / 完整覆盖", contradicting a banner that said the main chain
     is elsewhere (ZEST → stacks). Decide on `primary_chain` when it is known.
+
+    v1.2.16 (product spec 2026-07-01, UB): `primary_chain` is the TRADING chain (BSC, where
+    Alpha trades) — but a token can trade on BSC while the BULK of its SUPPLY lives
+    on another chain. `detect_multichain_split` (real surf on-chain holder balances,
+    NOT metadata) is the skill's authoritative multi-chain check; when it fires
+    (supply_split.split), this section MUST report multi-chain, not "单链 完整覆盖".
+    UB: trades on BSC but 87.3% of supply sits on a verified Ethereum contract →
+    the old output "单链 完整覆盖" contradicted the chip's Ethereum-canonical
+    overhang. `supply_split` = the supply_chain_overhang / detect_multichain_split
+    result; when present with split=True the supply / cross-chain / coverage rows
+    are recomputed to name the supply-dominant chain.
     """
     if primary_chain:
         is_bsc_primary = primary_chain.strip().lower() in _BSC_PRIMARY_ALIASES
     else:
         # No cross-chain signal available → fall back to the venue chain.
         is_bsc_primary = chain_label == "BSC"
+
+    _split_on = bool((supply_split or {}).get("split")) and not (supply_split or {}).get("_error")
+    _supply_label = (supply_split or {}).get("supply_chain_label") or (
+        supply_split or {}).get("supply_chain") or ""
+    _supply_pct = float((supply_split or {}).get("supply_pct_of_total") or 0)
 
     chain_name = t(f"section.multi_chain.chain_name_{chain_label}")
     if chain_name.startswith("[MISSING:"):
@@ -114,6 +131,28 @@ def run(
             else t("section.multi_chain.gate_note_non_bsc", primary=primary_chain)
         )
 
+    # v1.2.16: a real supply split (detect_multichain_split, on-chain) overrides the
+    # single-chain framing — the token trades on `chain_label` but the bulk of supply
+    # lives on `_supply_label`. Never claim "单链 完整覆盖" in this case.
+    supply_row_value = (
+        t("section.multi_chain.value_supply_chain_with_total",
+          chain=supply_chain_for_row, total=total_supply)
+        if total_supply
+        else t("section.multi_chain.value_supply_chain", chain=supply_chain_for_row)
+    )
+    if _split_on and not holder_snapshot_mode:
+        supply_row_value = t("section.multi_chain.value_supply_chain_split",
+                             supply=_supply_label, pct="%.1f" % _supply_pct,
+                             total=total_supply or 0)
+        cross_chain_value = t("section.multi_chain.value_cross_chain_supply_split",
+                              venue=chain_label, supply=_supply_label,
+                              pct="%.1f" % _supply_pct)
+        coverage_value = t("section.multi_chain.value_coverage_supply_split",
+                           venue=chain_label, supply=_supply_label)
+        gate_note_value = t("section.multi_chain.gate_note_supply_split",
+                            supply=_supply_label, pct="%.1f" % _supply_pct,
+                            venue=chain_label)
+
     rows = [
         {
             "item": t("section.multi_chain.label_main_chain"),
@@ -121,12 +160,7 @@ def run(
         },
         {
             "item": t("section.multi_chain.label_supply_chain"),
-            "value": (
-                t("section.multi_chain.value_supply_chain_with_total",
-                  chain=supply_chain_for_row, total=total_supply)
-                if total_supply
-                else t("section.multi_chain.value_supply_chain", chain=supply_chain_for_row)
-            ),
+            "value": supply_row_value,
         },
         {
             "item": t("section.multi_chain.label_trading_chain"),
@@ -151,10 +185,11 @@ def run(
         # v0.7.21.8: still True on holder-snapshot chains — there literally is
         # only one chain involved (no BSC mirror); coverage is "single chain,
         # snapshot only" rather than "single chain, full SQL".
-        "single_chain": True,
+        "single_chain": not (_split_on and not holder_snapshot_mode),
         "chain_label": chain_label,
         "primary_chain": primary_chain,
         "is_bsc_primary": is_bsc_primary,
+        "supply_split": _split_on,
         "holder_snapshot_mode": holder_snapshot_mode,
         "rows": rows,
         "gate_note": gate_note_value,

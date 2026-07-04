@@ -1894,6 +1894,25 @@ def build_skeleton(
     timings["supply_chain_overhang"] = time.perf_counter() - t
     _ck("supply_chain_overhang", supply_chain_overhang)
 
+    # v1.2.16 (product spec 2026-07-01, UB): section_multi_chain ran in Round 5 BEFORE the
+    # supply-split was known, so it reported "单链 完整覆盖" even when
+    # detect_multichain_split found the bulk of supply on another chain (UB: 87.3%
+    # on a verified Ethereum contract). Re-run it now with the split result so the
+    # 多链 rows agree with the chip's supply-chain-overhang framing.
+    if isinstance(supply_chain_overhang, dict) and supply_chain_overhang.get("split") \
+            and not supply_chain_overhang.get("_error") and not holder_snapshot_mode:
+        try:
+            multi_chain = section_multi_chain_run(
+                chain_label=scope["chain_label"],
+                total_supply=scope.get("total_supply"),
+                primary_chain=scope.get("primary_chain"),
+                holder_snapshot_mode=holder_snapshot_mode,
+                supply_split=supply_chain_overhang,
+            )
+        except Exception as _e:
+            import sys as _sys
+            print(f"[multi_chain re-run] failed (non-fatal): {_e}", file=_sys.stderr)
+
     # ---------- Round 7g: primary-sale (CCA / IDO) attribution — UNIVERSAL ----------
     # Self-check EVERY token for project public-distribution pools (CCA / IDO /
     # launchpad / airdrop redemption) and attribute insider/KOL capture. Multi-
