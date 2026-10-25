@@ -33,3 +33,11 @@ def test_no_retry_when_blocked(monkeypatch, tmp_path):
 def test_retry_disallowed_in_dry_run(monkeypatch):
     monkeypatch.setenv("HF_API_MODE", "count")
     assert r11._r11_transient_retry_allowed() is False
+
+def test_retry_hard_cap(monkeypatch):
+    monkeypatch.setenv("HF_API_MODE", "live"); monkeypatch.setenv("HF_R11_RETRY", "50")
+    monkeypatch.setattr(r11, "_R11_RETRIES_USED", 0)
+    import api_gateway as gw
+    monkeypatch.setattr(gw, "S", None); monkeypatch.setattr(gw, "_KEYS", None)
+    got = [r11._r11_transient_retry_allowed() for _ in range(5)]
+    assert got == [True, False, False, False, False]

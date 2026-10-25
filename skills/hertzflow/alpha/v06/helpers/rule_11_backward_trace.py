@@ -571,9 +571,21 @@ def outflow_window_ceiling(alpha_listing_date: str, mint_date_day: str,
     return min(ext, t), True
 
 
+_R11_RETRIES_USED = 0
+R11_RETRY_HARD_CAP = 1   # absolute per-process ceiling, env can only lower it
+
+
 def _r11_transient_retry_allowed() -> bool:
-    """Perseus fix 2: retry only when a retry could succeed."""
-    if os.environ.get("HF_R11_RETRY", "1") == "0":
+    """Perseus fix 2: retry only when a retry could succeed, and at most
+    min(HF_R11_RETRY, R11_RETRY_HARD_CAP) times per process. Each retry
+    re-runs only the fast slice (listing-90d..+7d = 1-2 SQL chunks, 4 cr
+    each), so the worst-case extra cost is 8 credits per run."""
+    global _R11_RETRIES_USED
+    try:
+        cap = min(int(os.environ.get("HF_R11_RETRY", "1")), R11_RETRY_HARD_CAP)
+    except ValueError:
+        cap = R11_RETRY_HARD_CAP
+    if _R11_RETRIES_USED >= cap:
         return False
     if os.environ.get("HF_API_MODE", "live") != "live":
         return False
@@ -585,6 +597,7 @@ def _r11_transient_retry_allowed() -> bool:
             return False
     except Exception:
         pass
+    _R11_RETRIES_USED += 1
     return True
 
 
