@@ -5,10 +5,13 @@ import json, os, sys, threading, time, subprocess, types, unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "helpers"))
 os.environ.update({"HF_CACHE": "0", "HF_ASYNC_POLL_SECS": "0.01", "HF_BUDGET": "0"})
+_ENV_BEFORE = dict(os.environ)
 for i in range(4, 12):
     os.environ[f"SURF_API_KEY_{i}"] = f"fake-key-{i}"
 os.environ["SURF_API_KEY"] = "fake-stray-override"
 import api_gateway as gw
+_ORIG_RUN = subprocess.run
+_ORIG_REAL = gw._REAL_RUN
 
 gw._random = types.SimpleNamespace(uniform=lambda a, b: 0.0)
 gw._backoff = lambda attempt, err: 0.0
@@ -64,6 +67,19 @@ class T(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         gw.install(None)
+
+    @classmethod
+    def tearDownClass(cls):
+        # Perseus fork: undo the global gateway install so later test modules
+        # see the real subprocess.run (was polluting test_v0713_*).
+        subprocess.run = _ORIG_RUN
+        gw._REAL_RUN = _ORIG_REAL
+        gw._INSTALLED = False
+        for k in ["HF_CACHE", "HF_ASYNC_POLL_SECS", "HF_BUDGET", "SURF_API_KEY"] + [f"SURF_API_KEY_{i}" for i in range(4, 12)]:
+            if k in _ENV_BEFORE:
+                os.environ[k] = _ENV_BEFORE[k]
+            else:
+                os.environ.pop(k, None)
 
     def setUp(self):
         gw.S.breaker_tripped = None
