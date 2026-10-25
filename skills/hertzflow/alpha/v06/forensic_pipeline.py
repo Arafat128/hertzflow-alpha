@@ -3008,7 +3008,13 @@ def main() -> int:
                     help="Hard per-run paid surf call budget (default 150).")
     ap.add_argument("--no-cache", action="store_true",
                     help="Bypass the response cache (/workspace/hertzflow-cache).")
+    # Perseus fix 8: --symbol-hint broke the $BTW run. Refuse it explicitly
+    # (with a reason) instead of a bare argparse "unrecognized arguments".
+    ap.add_argument("--symbol-hint", dest="symbol_hint", default=None, help=argparse.SUPPRESS)
     args = ap.parse_args()
+    if args.symbol_hint is not None and os.environ.get("HF_ALLOW_SYMBOL_HINT") != "1":
+        ap.error("--symbol-hint is disabled in the Perseus fork (it broke the $BTW run "
+                 "2026-10-13: wrong Alpha entry matched). Pass the exact CA instead.")
     if args.dry_run:
         os.environ["HF_API_MODE"] = "count"
     if args.max_credits is not None:
