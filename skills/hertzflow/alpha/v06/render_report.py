@@ -448,13 +448,16 @@ _{{ t("report.meta_line_tier", tier=tier_classification.tier, s1_date=tier_class
 {# 纯内幕剩 5%+ 进一步加 risk #}
 {% if _pure_pct > 5 -%}{% set _v.risk = _v.risk + 2 -%}{%- endif -%}
 {% if _v.risk > 10 -%}{% set _v.risk = 10 -%}{%- endif -%}
+{# Perseus fix 7: no paid data → UNKNOWN, never CLEAN from empty inputs #}
+{% if _pl_no_data -%}{% set _v.subtype = "UNKNOWN" -%}{% set _v.subtype_zh = "UNKNOWN (data gap)" -%}{% set _v.label = _pl_gap_label -%}{% set _v.risk = 0 -%}{%- endif -%}
 
 {% if decision_summary is defined and decision_summary %}
 ## {{ t("render.decision_summary_h2") }}
 
 | {{ t("render.market_col_item") }} | {{ t("render.market_col_value") }} |
 |---|---|
-| **{{ t("render.decision_risk_score") }}** | **{% for _ in range(_v.risk) %}🟥{% endfor %}{% for _ in range(10 - _v.risk) %}⬜{% endfor %} ({{ _v.risk }}/10)** |
+{% if _pl_no_data %}| **{{ t("render.decision_risk_score") }}** | **UNKNOWN (not measured — data gap)** |{% else %}| **{{ t("render.decision_risk_score") }}** | **{% for _ in range(_v.risk) %}🟥{% endfor %}{% for _ in range(10 - _v.risk) %}⬜{% endfor %} ({{ _v.risk }}/10)** |{% endif %}
+
 | **{{ t("render.decision_chain_state_label") }}** | **{{ _v.subtype_zh }}** — {{ _v.label }} |
 | {{ t("render.market_primary_chain") }} | {{ decision_summary.primary_chain or "—" | md_cell }}{% if decision_summary.primary_chain_lp_usd %} ({{ t("render.decision_chain_lp", usd="{:,.0f}".format(decision_summary.primary_chain_lp_usd)) }}){% endif %} |
 | **{{ t("render.decision_entry_cap") }}** | **{% if decision_summary.entry_size_cap_usd %}${{ "{:,.0f}".format(decision_summary.entry_size_cap_usd) }}{% else %}—{% endif %}** |
@@ -480,7 +483,8 @@ _{{ t("report.meta_line_tier", tier=tier_classification.tier, s1_date=tier_class
    那行 — 是 3 档系统的 baseline-AVOID + downgrade-1-tier 衍生品, 5 档不再
    需要这种 "降级路径" 概念.
    v0.7.25: "结论" → "链上状态" 避免 判定 含交易判断含义. #}
-## {{ t("render.chain_state_h2", subtype_zh=_v.subtype_zh, risk=_v.risk) }}
+{% if _pl_no_data %}## 🎯 On-chain state: UNKNOWN — data gap (risk not measured){% else %}## {{ t("render.chain_state_h2", subtype_zh=_v.subtype_zh, risk=_v.risk) }}{% endif %}
+
 
 **{{ _v.label }}**
 
@@ -2877,7 +2881,7 @@ _v{{ _schema_version }} · {{ meta.chain }} · {{ t("render.market_alpha_listed"
 
 ## {{ t("render.tldr_chain_state_h2") }}
 
-**`{{ _v.subtype }}`** ({{ _v.risk }}/10) — {{ _v.label | md_cell }}
+**`{{ _v.subtype }}`** ({% if _pl_no_data %}risk not measured{% else %}{{ _v.risk }}/10{% endif %}) — {{ _v.label | md_cell }}
 
 {# v0.8.0 fix: use dict.get() instead of attribute access since
    StrictUndefined raises on absent keys (ZEST fixture only has subset
@@ -3253,6 +3257,8 @@ def render(skeleton_path: str, filled_path: str, out_path: str, mode: str = "def
     # Default mode is unchanged from v0.7.28 behavior.
     _context = dict(filled)
     _context["mode"] = mode
+    _context["_pl_no_data"] = bool(filled.get("_no_data"))   # Perseus fix 7
+    _context["_pl_gap_label"] = filled.get("chain_state_label") or "UNKNOWN — data gap"
     if mode == "tldr":
         template = env.from_string(_TLDR_TEMPLATE)
         # TLDR template references `_v.subtype/label/risk` for parity

@@ -27,3 +27,13 @@ def test_zero_balance_is_unknown(tmp_path):
     m, sk = _run(G["IRYS"]["ca"], "emulate_zero_balance", tmp_path)
     s = json.loads(sk.read_text())
     assert s["chain_state"] == "UNKNOWN" and s["chain_state_risk_score"] is None and s["_no_data"]
+
+def test_zero_balance_report_says_unknown(tmp_path):
+    _, sk = _run(G["IRYS"]["ca"], "emulate_zero_balance", tmp_path)
+    fill = tmp_path / "fill.json"
+    fill.write_text(sk.read_text(encoding="utf-8").replace("<LLM_NARRATIVE_PLACEHOLDER>", "smoke"), encoding="utf-8")
+    out = tmp_path / "r.md"
+    subprocess.run([sys.executable, str(V06 / "render_report.py"), "--skeleton", str(sk), "--filled", str(fill),
+                    "--out", str(out), "--lang", "en"], capture_output=True, text=True, timeout=120)
+    md = out.read_text(encoding="utf-8")
+    assert "On-chain state: UNKNOWN" in md and "No significant trigger (risk score 0/10)" not in md

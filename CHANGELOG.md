@@ -27,5 +27,5 @@ Upstream base: hertzflow v1.2.16 (`ffcf579`, see UPSTREAM.md). Fork tag: `v1.2.1
 
 ## Known open items
 - Upstream zh copy test `test_zh_json_term_discipline_派发_vs_分发` is xfailed (zh copy drift; EN unaffected).
-- The jinja template has its own chain-state derivation that is not patched; the skeleton override (fix 7) is what the EN renderer reads.
+- zh render of a `_no_data` run uses the same jinja override (EN verified; zh not exercised).
 - Dry-run cannot exercise rule_11 step 2 or the retry (step 1 returns no rows in count mode), so their credit effect is from code analysis, not measurement.
