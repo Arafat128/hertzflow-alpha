@@ -108,39 +108,11 @@ def check_for_update(
     if is_newer and not quiet:
         _print_warning(local_version, latest_version)
 
-        # v0.9.5: auto-update on detection. Run `npx skills update hertzflow`
-        # synchronously; on success, save new SHA to cache. Return a signal
-        # field `auto_updated=True` so the CLI entry-point can `sys.exit(0)`
-        # without killing imported library callers (e.g. Discord bot batches
-        # that call build_skeleton in-process — audit Finding 1).
-        # Opt-out via env so anyone debugging against a specific old version
-        # can keep running.
-        auto_update_off = os.environ.get(
-            "BINANCE_ALPHA_NO_AUTO_UPDATE", ""
-        ).strip().lower() in ("1", "true", "yes")
-        if not auto_update_off:
-            ok, reason = _run_auto_update(
-                latest_sha or "", installed_file, cache_path,
-            )
-            if ok:
-                _print_auto_update_success(local_version, latest_version)
-                result["auto_updated"] = True
-                # Refresh cache (version-based) so next probe sees current.
-                _save_cache(cache_path, {
-                    "installed": latest_version, "latest": latest_version,
-                    "is_newer": False, "checked_ts": int(time.time()),
-                    "latest_sha": latest_sha or "",
-                })
-                return result
-            else:
-                _print_auto_update_failed(reason)
-                # audit v0.9.5 R1 Finding 3: failed auto-update must
-                # NOT cache is_newer=True for 24h — user might fix npm in
-                # 30s and rerun. Drop the cache so next probe re-attempts.
-                try:
-                    cache_path.unlink(missing_ok=True)
-                except (OSError, TypeError):
-                    pass
+        # Perseus fork (pl): REPORT ONLY. Upstream auto-update (`npx skills
+        # update hertzflow`) is removed: it would overwrite this maintained fork.
+        print("   [perseus-fork] upstream change detected — report only; "
+              "review upstream diff manually, never run `npx skills update`.",
+              file=sys.stderr)
 
     return result
 
@@ -170,6 +142,7 @@ def _run_auto_update(
     failed-update message (timeout / npx_missing / no_skills_cli /
     no_change_on_disk / exit_N).
     """
+    return False, "disabled_in_fork"
     # F2: snapshot version BEFORE invoking any subprocess.
     pre_update_version = _read_disk_version()
 
@@ -396,7 +369,7 @@ def _print_warning(old: str, new: str) -> None:
     except Exception:
         # Fall back to English if i18n itself fails
         print(f"\n🆕 New version available ({old or '?'} → {new})", file=sys.stderr)
-        print(f"   Run `npx skills update hertzflow` to update\n", file=sys.stderr)
+        print(f"   Perseus fork: report only — review upstream manually (do not run npx skills update)\n", file=sys.stderr)
 
 
 if __name__ == "__main__":

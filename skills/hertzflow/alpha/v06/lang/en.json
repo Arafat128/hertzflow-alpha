@@ -384,7 +384,7 @@
   },
   "update_check": {
    "title": "🆕 New version available ({old} → {new})",
-   "action": "Run `npx skills update hertzflow` to update"
+   "action": "Perseus fork: report only — review upstream manually (do not run npx skills update)"
   },
   "funding_attribution": {
    "title": "💰 High-Value Address Funding Source (mint / DEX / P2P)",

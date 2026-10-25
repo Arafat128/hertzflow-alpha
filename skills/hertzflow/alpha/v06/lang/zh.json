@@ -384,7 +384,7 @@
   },
   "update_check": {
    "title": "🆕 发现新版本 ({old} → {new})",
-   "action": "运行 `npx skills update hertzflow` 升级"
+   "action": "Perseus fork：仅提示，请人工审阅上游（勿运行 npx skills update）"
   },
   "funding_attribution": {
    "title": "💰 高价值地址资金来源 (mint / DEX / P2P)",
