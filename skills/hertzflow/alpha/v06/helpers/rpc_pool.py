@@ -14,7 +14,7 @@ _HERE = Path(__file__).resolve().parent
 _YAML = _HERE.parent / "rpcs.yaml"
 _DEFAULT = {  # used only if rpcs.yaml / PyYAML unavailable
     "ethereum": (1, ["https://ethereum.publicnode.com", "https://eth.llamarpc.com"]),
-    "bsc": (56, ["https://bsc-dataseed.binance.org", "https://bsc.publicnode.com"]),
+    "bsc": (56, ["https://bsc-dataseed.binance.org", "https://bsc.publicnode.com", "https://bsc-dataseed1.defibit.io"]),
     "polygon": (137, ["https://polygon-rpc.com", "https://polygon.publicnode.com"]),
     "base": (8453, ["https://mainnet.base.org", "https://base.publicnode.com"]),
     "arbitrum": (42161, ["https://arb1.arbitrum.io/rpc", "https://arbitrum.publicnode.com"]),
