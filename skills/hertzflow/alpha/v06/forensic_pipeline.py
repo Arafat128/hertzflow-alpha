@@ -3017,6 +3017,13 @@ def main() -> int:
                  "2026-10-13: wrong Alpha entry matched). Pass the exact CA instead.")
     if args.dry_run:
         os.environ["HF_API_MODE"] = "count"
+    # Perseus Desk 01 rule: live runs have NO credit cap (HF_BUDGET=0); a
+    # --max-credits cap on a live run is refused (HF_ALLOW_CAP=1 overrides).
+    if os.environ.get("HF_API_MODE", "live") == "live":
+        os.environ.setdefault("HF_BUDGET", "0")
+        if args.max_credits is not None and os.environ.get("HF_ALLOW_CAP") != "1":
+            ap.error("--max-credits is not allowed on a Desk 01 live run (no credit cap; HF_BUDGET=0). "
+                     "Run --dry-run first to see the estimate.")
     if args.max_credits is not None:
         os.environ["HF_MAX_CREDITS"] = str(args.max_credits)
     if args.max_calls is not None:
@@ -3193,7 +3200,10 @@ def main() -> int:
     try:
         import run_manifest as _rm
         _mp = _rm.write(monitoring_parent if args.out_dir else skeleton_path.parent,
-                        {"ca": ca, "mode": os.environ.get("HF_API_MODE", "live"), "status": status})
+                        {"ca": ca, "mode": os.environ.get("HF_API_MODE", "live"), "status": status,
+                         "budget_on": os.environ.get("HF_BUDGET", "1") != "0",
+                         "max_credits": os.environ.get("HF_MAX_CREDITS")})
+        _rm.record_dry_run(_mp.parent.parent, ca, os.environ.get("HF_API_MODE", "live"))
         print(f"  manifest: {_mp}", file=sys.stderr)
     except Exception as _e:
         print(f"[run_manifest] failed (non-fatal): {_e}", file=sys.stderr)

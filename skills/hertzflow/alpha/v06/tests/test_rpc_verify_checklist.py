@@ -32,7 +32,13 @@ def test_verify_and_checklist(tmp_path, monkeypatch):
     assert st[("holder_balance", SAFE)]["status"] == "MATCH" and "Safe 1-of-1" in st[("holder_balance", SAFE)]["note"]
     assert st[("holder_balance", EOA)]["status"] == "DRIFT"
     assert d["surf_credits"] == 0
+    p, n0 = sc.build(tmp_path)
+    assert "ARKHAM REQUIRED" in p.read_text()
+    (tmp_path / ".work" / "arkham_xcheck.json").write_text(json.dumps({"status": "ok", "truncated": [SAFE],
+        "labels": [{"addr": SAFE, "entity": "Bitget", "label": "Hot Wallet"}, {"addr": EOA, "entity": "unlabelled"}],
+        "inferences": []}))
     p, n = sc.build(tmp_path)
     t = p.read_text()
+    assert "Arkham labels [A] to confirm" in t and "Bitget (Hot Wallet)" in t and "stopped at 100" in t
     assert "Balances moved" in t and "Data gap (rule_11)" in t and "Already verified by free RPC" in t
-    assert n == 1 + 1 + len(sc.OFFCHAIN)
+    assert n == 1 + 1 + 2 + len(sc.OFFCHAIN)

@@ -43,6 +43,21 @@ def build(run: Path, extra=()):
                      + ". Confirm the moves and where the tokens went.")
     for g in sk.get("_data_gaps") or []:
         n += 1; lines.append(f"{n}. [ ] Data gap ({g.get('section')}): {g.get('reason') or g.get('why')} — Surf: what is the real value?")
+    ap_ = run / ".work" / "arkham_xcheck.json"
+    ark = json.loads(ap_.read_text()) if ap_.exists() else None
+    if ark is None or ark.get("status") not in ("ok", "partial"):
+        n += 1; lines.append(f"{n}. [ ] ARKHAM REQUIRED: arkham_xcheck {'missing' if ark is None else ark.get('status')} — run it before Surf.")
+    else:
+        labs = [l for l in ark.get("labels") or [] if l.get("entity") not in (None, "unlabelled")]
+        if labs:
+            n += 1
+            lines.append(f"{n}. [ ] Arkham labels [A] to confirm: " + "; ".join(
+                f"{short(l['addr'])} = {l['entity']}" + (f" ({l['label']})" if l.get("label") else "") for l in labs[:10]) + ".")
+        if ark.get("truncated"):
+            n += 1; lines.append(f"{n}. [ ] Full outflow totals for {', '.join(short(a) for a in ark['truncated'][:6])} "
+                                 "(Arkham stopped at 100 transfers — lower bounds).")
+        for i in (ark.get("inferences") or [])[:4]:
+            n += 1; lines.append(f"{n}. [ ] [I] {short(i['addr'])}: {i['inference']} — agree?")
     for t in list(OFFCHAIN) + list(extra):
         n += 1; lines.append(f"{n}. [ ] {t}")
     out = run / "surf-verify-checklist.auto.md"

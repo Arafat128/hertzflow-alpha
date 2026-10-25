@@ -2,6 +2,22 @@
 
 Upstream base: hertzflow v1.2.16 (`ffcf579`, see UPSTREAM.md). Fork tag: `v1.2.16-pl.1`.
 
+
+## Desk 01 operator rules enforced in the PDF gate (2026-10-26)
+- New `scripts/preflight_pdf.py`; `build_pdf.py` runs it before (exit 3) and after (exit 4,
+  output renamed `*.BLOCKED.pdf`) building. Named gates: ARKHAM_REQUIRED, DRY_RUN_FIRST,
+  NO_CREDIT_CAP, SURF_VERIFY, FRAMES ("NEXT: Visual"), FANOUTS, BRIEF_SECTIONS, SOURCE_TAGS,
+  TRACE; post: OVERFLOW, LINT_PRICE_TARGET, LINT_TRADE_WORDS, LINT_CLEAN_ON_GAP, REPORT_SECTIONS.
+  `--waive NAME` is logged in `.work/preflight_pdf.json`.
+- Live runs default to HF_BUDGET=0 (no credit cap); `--max-credits` on a live run is refused
+  (HF_ALLOW_CAP=1 overrides). run_manifest records budget_on/max_credits; count-mode runs write
+  `.work/dry_run.json` + `hertzflow-cache/dry_runs/<ca>.json` as dry-run evidence.
+- build_pdf lays out the Style D default pack: cover (ticker, CA, chain, date, state tier, RISK),
+  "HertzFlow (skill output only)" block, brief body, Visual frames + fan-outs, Arkham cross-check
+  (side-by-side note), Limitations and what's left out, optional Requester question, Sources, NFA.
+  Footer no longer says "Sources"/"Not financial advice" (keeps the order check meaningful).
+- tests/test_preflight_pdf.py: a test for each gate.
+
 ## Unreleased (after v1.2.16-pl.1)
 ### Safety
 - update_check is report-only; the npx auto-update path is gone.
@@ -24,6 +40,13 @@ Upstream base: hertzflow v1.2.16 (`ffcf579`, see UPSTREAM.md). Fork tag: `v1.2.1
 - `helpers/arkham_xcheck.py` — Arkham cross-check, plan-only unless `--live`, flags 100-row cap truncation.
 - `scripts/build_pdf.py` — one-script Style D PDF from skeleton + brief + frames (never overwrites).
 - Smoke tests (`tests/smoke`, `HF_SMOKE=1`) and GitHub Actions CI.
+
+### Arkham cross-check is mandatory (Desk 01 rule 2026-10-21)
+- `helpers/arkham_xcheck.py` runs **live by default**; `--plan-only`, `HF_DRY_RUN=1` or `HF_API_MODE=count|emulate_zero_balance` only plan (0 Arkham calls).
+- `.work/arkham_xcheck.json` keeps `labels` [A], `facts` [F] and `inferences` [I] separate; status `ok|partial|failed|plan_only`; per-call errors kept with reason; transfer pulls hitting the 100-row cap are flagged `truncated_at_cap` (lower bounds).
+- Writes `.work/fanout/<SYM>-fan-N-<role>-<addr>.json` specs for `/workspace/style-refs/fanout.py` (render checked locally).
+- `scripts/build_pdf.py` refuses (exit 3, "ARKHAM REQUIRED") when `arkham_xcheck.json` is missing, unreadable, `failed` or `plan_only`; the PDF always has an "Arkham cross-check" section, and errored calls show UNKNOWN with the reason.
+- `scripts/surf_checklist.py` lists the Arkham [A] labels to confirm, the 100-cap truncated addresses and [I] inferences, or "ARKHAM REQUIRED" if the check is missing.
 
 ## Known open items
 - Upstream zh copy test `test_zh_json_term_discipline_派发_vs_分发` is xfailed (zh copy drift; EN unaffected).

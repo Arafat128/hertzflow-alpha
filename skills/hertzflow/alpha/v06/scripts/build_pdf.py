@@ -127,8 +127,91 @@ def slug(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
 
 
+class ArkhamRequired(SystemExit):
+    pass
+
+
+def load_arkham(run: Path) -> dict:
+    """Desk 01 rule (2026-10-21): no PDF without a live Arkham cross-check."""
+    p = run / ".work" / "arkham_xcheck.json"
+    if not p.exists():
+        raise ArkhamRequired(f"ARKHAM REQUIRED: {p} missing — run helpers/arkham_xcheck.py {run}")
+    try:
+        ark = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise ArkhamRequired(f"ARKHAM REQUIRED: {p} unreadable ({type(e).__name__})")
+    if ark.get("status") not in ("ok", "partial"):
+        raise ArkhamRequired(f"ARKHAM REQUIRED: arkham_xcheck status={ark.get('status')!r} "
+                             f"({ark.get('plan_only_reason') or '; '.join(str(e.get('reason')) for e in ark.get('errors') or [])[:200]})")
+    return ark
+
+
+def arkham_blocks(ark: dict) -> list:
+    """Always-present Arkham section. Errors show UNKNOWN + reason."""
+    U = '<b class="r">UNKNOWN</b>'
+    b = [(f'<p class="b sm">Arkham cross-check {esc(ark.get("written", ""))} (Asia/Dhaka) · status '
+          f'<b>{esc(ark.get("status", "?"))}</b> · {ark.get("arkham_calls", 0)} calls · '
+          f'{len(ark.get("truncated") or [])} truncated at {ark.get("page_cap", 100)} transfers (lower bounds). '
+          '[A] Arkham label · [F] on-chain fact · [I] inference.</p>', 2)]
+    rows = [["Address", "Chain", "[A] Entity / label"]]
+    for l in ark.get("labels") or []:
+        ent = U + f' — {esc(str(l.get("reason")))}' if l.get("entity") == "UNKNOWN" else esc(str(l.get("entity")))
+        rows.append([esc(l["addr"]), esc(str(l.get("chain"))), ent + (f' · {esc(l["label"])}' if l.get("label") else "")])
+    frows = [["Address", "[F] Outflows", "Recipients", "Total out", "Cap"]]
+    for f in ark.get("facts") or []:
+        if f.get("fact") == "UNKNOWN":
+            frows.append([esc(f["addr"]), U + f' — {esc(str(f.get("reason")))}', "", "", ""])
+        else:
+            frows.append([esc(f["addr"]), str(f["outflow_transfers"]), str(f["distinct_destinations"]),
+                          f'{f["outflow_total"]:,.0f}', '<b class="r">TRUNCATED @100</b>' if f.get("truncated_at_cap") else "complete"])
+    for tbl in (rows, frows):
+        if len(tbl) == 1:
+            tbl.append([U, "no rows returned", "", "", ""][:len(tbl[0])])
+        hd = '<table class="t"><tr>' + "".join(f"<th>{c}</th>" for c in tbl[0]) + "</tr>"
+        for k in range(1, len(tbl), 8):
+            b.append((hd + "".join("<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in tbl[k:k + 8])
+                      + "</table>", 10))
+    inf = ark.get("inferences") or []
+    b.append(('<ul class="b sm">' + ("".join(f'<li>[I] {esc(i["addr"])}: {esc(i["inference"])}</li>' for i in inf)
+                                     or "<li>[I] none drawn</li>") + "</ul>", 1 + len(inf)))
+    if ark.get("errors"):
+        b.append(('<p class="b sm r">Arkham errors: ' + "; ".join(
+            f'{esc(str(e.get("addr")))} {esc(str(e.get("call")))}: {esc(str(e.get("reason")))}' for e in ark["errors"][:8]) + "</p>", 2))
+    return b
+
+
+def hertzflow_block(sk: dict, state: str, tier, risk_s: str) -> str:
+    """'HertzFlow (skill output only)' — skeleton facts, no Surf/Arkham/inference."""
+    from collections import Counter
+    sco = sk.get("supply_chain_overhang") or {}
+    if sco:
+        chip = (f'operator {sco.get("operator_pct", "?")}% · relay {sco.get("relay_pct", "?")}% · '
+                f'non-operator {sco.get("non_operator_pct", "?")}% ({esc(str(sco.get("supply_chain_label") or ""))})')
+    else:
+        rr = (sk.get("holdings_distribution") or {}).get("role_rows") or []
+        chip = " · ".join(f'{esc(str(r.get("role")))} {float(r.get("pct_of_total") or 0):.2f}%' for r in rr[:6]) or "UNKNOWN — no chip data"
+    roles = Counter(v.get("primary_role") for v in (sk.get("address_role_index") or {}).values() if isinstance(v, dict))
+    if not roles:
+        roles = Counter(w.get("monitor_role_enum") for w in sk.get("monitoring_wallets") or [])
+    roles_s = " · ".join(f"{esc(str(k))} {n}" for k, n in roles.most_common(8)) or "UNKNOWN — no role index"
+    waves = (sk.get("anomaly") or {}).get("waves") or []
+    det = [f'{esc(re.sub(r"^[^A-Za-z]*", "", w.get("title", "")))}: {len(w.get("events") or [])} events' for w in waves]
+    hoa = sk.get("hidden_operator_activity")
+    if isinstance(hoa, dict) and hoa:
+        det.append("hidden-operator detector: " + esc(", ".join(f"{k}={v}" for k, v in list(hoa.items())[:4]
+                                                              if isinstance(v, (int, float, str, bool)))[:160]))
+    rows = [("State tier", f"{esc(state)} · catalyst tier {esc(str(tier))}"),
+            ("Chain state / risk", f'{esc(str(sk.get("chain_state_label") or state))} · RISK {esc(risk_s)}'),
+            ("Chip split", chip), ("Wallet roles", roles_s),
+            ("Detector findings", "<br>".join(det) or "none reported")]
+    return ('<h2 class="h2">HertzFlow (skill output only)</h2><p class="b sm">Source: HertzFlow skeleton '
+            '(.work/skeleton.json) only — no Surf, Arkham or inference in this block.</p><table class="t">'
+            + "".join(f"<tr><th>{k}</th><td>{v} <i>[HertzFlow]</i></td></tr>" for k, v in rows) + "</table>")
+
+
 def build(run: Path, out: Path | None, brief: Path, assets: Path, force: bool, render: bool = True,
           budget: int = PAGE_BUDGET) -> dict:
+    ark = load_arkham(run)
     sk = json.loads((run / ".work" / "skeleton.json").read_text())
     meta = sk.get("meta", {})
     sym = meta.get("symbol") or "TOKEN"
@@ -148,7 +231,7 @@ def build(run: Path, out: Path | None, brief: Path, assets: Path, force: bool, r
     if sk.get("_no_data"):
         core.append(("Data gaps", str(len(sk.get("_data_gaps") or [])), "r"))
     foot = (f"Perseus Research Lab | ${sym} forensic brief | built {now:%Y-%m-%d %H:%M} (Asia/Dhaka) | "
-            "Sources: HertzFlow Alpha Skill, Surf, Arkham, RPC | Not financial advice. No price target.")
+            "Data: HertzFlow Alpha Skill, Surf, Arkham, RPC | NFA")
 
     def sidebar(i, t):
         o = ['<div class="side"><span class="lab">Perseus Research Lab</span>']
@@ -169,23 +252,49 @@ def build(run: Path, out: Path | None, brief: Path, assets: Path, force: bool, r
     cov = f'<div class="cvt"><h1 class="hl" style="font-size:18pt;margin:0 0 2mm">{inline(title or "$" + sym)}</h1></div>'
     if cover:
         cov += fig(cover, "105mm")
-    cov += (f'<p class="b sm" style="font-family:\'IBM Plex Mono\',monospace">CA {esc(meta.get("contract_address", ""))} · '
+    cov += (f'<p class="b sm" style="font-family:\'IBM Plex Mono\',monospace">${esc(sym)} · CA {esc(meta.get("contract_address", ""))} · '
+            f'Chain {esc(chains)} · {now:%Y-%m-%d} (Asia/Dhaka) · State tier {esc(state)} · RISK {esc(risk_s)} · '
             f'Alpha listing {esc(str(meta.get("alpha_listing_date_utc")))} UTC</p>')
     if sk.get("_data_gaps"):
         cov += '<p class="b sm r"><b>Data gaps:</b> ' + "; ".join(esc(g.get("reason") or g.get("why", "")) for g in sk["_data_gaps"]) + "</p>"
     pages.append(("Cover", cov))
-    for name, lines in secs:
-        s = slug(name)
-        mine = [f for f in frames if f not in used and any(w in f.stem.lower() for w in s.split("-") if len(w) > 4)]
+    pages.append(("HertzFlow (skill output only)", hertzflow_block(sk, state, tier, risk_s)))
+
+    def kind(n):
+        n = n.lower()
+        return ("lim" if "limitation" in n else "req" if "requester" in n else "src" if re.search(r"\bsources?\b", n)
+                else "ark" if "arkham" in n else "body")
+    def add_sec(name, lines, frames_ok=True):
+        s_ = slug(name)
+        mine = [f for f in frames if frames_ok and f not in used and any(w in f.stem.lower() for w in s_.split("-") if len(w) > 4)]
         for k, chunk in enumerate(paginate(md_blocks(lines), budget)):
             pages.append((name if k == 0 else f"{name} (cont.)",
                           f'<h2 class="h2">{inline(name)}{" (cont.)" if k else ""}</h2>' + "".join(chunk)))
         for f in mine:
             used.add(f); pages.append((name, f'<h2 class="h2">{inline(name)}</h2>' + fig(f)))
-    for f in frames:
+    for name, lines in secs:
+        if kind(name) == "body":
+            add_sec(name, lines)
+    for f in frames:  # Visual's 4 frames + fan-outs not already placed
         if f not in used:
             nm = re.sub(r"^[A-Z0-9]+-", "", f.stem).replace("-", " ")
-            pages.append((nm.title(), f'<h2 class="h2">{esc(nm.title())}</h2>' + fig(f)))
+            used.add(f); pages.append((nm.title(), f'<h2 class="h2">{esc(nm.title())}</h2>' + fig(f)))
+    ark_secs = [(n, l) for n, l in secs if kind(n) == "ark"]
+    blocks = arkham_blocks(ark) + [b for _, l in ark_secs for b in md_blocks(l)]
+    for k, chunk in enumerate(paginate(blocks, budget)):
+        pages.append(("Arkham cross-check" + (" (cont.)" if k else ""),
+                      f'<h2 class="h2">Arkham cross-check{" (cont.)" if k else ""}</h2>'
+                      + ('<p class="b sm">Side-by-side note: Arkham view next to the HertzFlow view; neither overrides the other.</p>' if not k else "")
+                      + "".join(chunk)))
+    for want in ("lim", "req", "src"):
+        for name, lines in secs:
+            if kind(name) == want:
+                add_sec("Limitations and what's left out" if want == "lim" else name, lines, frames_ok=False)
+    nfa = '<p class="b"><b>Not financial advice.</b> No price target. Research notes only.</p>'
+    if kind(pages[-1][0]) == "src":
+        pages[-1] = (pages[-1][0], pages[-1][1] + nfa)
+    else:
+        pages.append(("NFA", nfa))
     body = "".join(
         f'<div class="pg p{i + 1}">{sidebar(i, t)}<div class="content"><div class="kick">Forensic brief · '
         f'{now:%d %b %Y} · {esc(t)}</div>{b}</div><div class="foot">{foot}<span class="pn">p.{i + 1}</span></div></div>'
@@ -214,8 +323,18 @@ def main() -> int:
     ap.add_argument("run_dir"); ap.add_argument("--out"); ap.add_argument("--brief")
     ap.add_argument("--assets", default=str(HERE / "assets" / "styleD_assets.json"))
     ap.add_argument("--force", action="store_true"); ap.add_argument("--html-only", action="store_true")
+    ap.add_argument("--waive", action="append", default=[], help="waive a named preflight rule (logged)")
     a = ap.parse_args()
     run = Path(a.run_dir).resolve()
+    import preflight_pdf as pf
+    fails = pf.pre(run)
+    pf.record(run, "pre", fails, set(a.waive)) if (run / ".work").is_dir() else None
+    hard = [f for f in fails if f[0] not in a.waive]
+    for n, why in fails:
+        print(f"{'WAIVED' if n in a.waive else 'PREFLIGHT FAIL'} {n}: {why}", file=sys.stderr)
+    if hard:
+        print(f"PDF BLOCKED by preflight ({len(hard)}): {', '.join(sorted({n for n, _ in hard}))}", file=sys.stderr)
+        return 3
     args = (run, Path(a.out) if a.out else None, Path(a.brief) if a.brief else run / "brief.md", Path(a.assets))
     budget, force = PAGE_BUDGET, a.force
     for _ in range(4):  # auto-shrink pages until Style D reports no overflow
@@ -224,6 +343,18 @@ def main() -> int:
         if a.html_only or not r["overflow"] or "overflow" not in r["overflow"]:
             break
         budget, force = int(budget * 0.8), True
+    n_fr = len(list((run / "frames").glob("*.png"))) if (run / "frames").is_dir() else 0
+    pfails = pf.post(run, Path(r["html"]), None if a.html_only else Path(r["pdf"]),
+                     None if a.html_only else r["overflow"], n_fr)
+    pf.record(run, "post", pfails, set(a.waive))
+    for n, why in pfails:
+        print(f"{'WAIVED' if n in a.waive else 'POSTFLIGHT FAIL'} {n}: {why}", file=sys.stderr)
+    if [f for f in pfails if f[0] not in a.waive]:
+        if not a.html_only and Path(r["pdf"]).exists():
+            b = Path(r["pdf"]).with_suffix(".BLOCKED.pdf"); Path(r["pdf"]).replace(b); r["pdf"] = str(b)
+        r["blocked"] = sorted({n for n, _ in pfails if n not in a.waive})
+        print(json.dumps(r, indent=1))
+        return 4
     print(json.dumps(r, indent=1))
     return 0
 

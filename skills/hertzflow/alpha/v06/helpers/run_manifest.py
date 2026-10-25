@@ -59,3 +59,37 @@ def verify(run_dir) -> dict:
         elif _sha(p) != meta["sha256"]:
             bad[rel] = "changed"
     return bad
+
+
+def _dry_root() -> Path:
+    return Path(os.environ.get("HF_DRYRUN_ROOT", "/workspace/hertzflow-cache/dry_runs"))
+
+
+def record_dry_run(run_dir, ca: str, mode: str) -> None:
+    """Desk 01 rule: a --dry-run precedes every live run. Count-mode runs leave
+    evidence in <run>/.work/dry_run.json and the shared dry_runs/<ca>.json."""
+    if mode != "count" or not ca:
+        return
+    doc = {"ca": ca.lower(), "written": now_str(), "ts": __import__("time").time()}
+    try:
+        s = json.loads((Path(run_dir) / ".work" / "api_summary.json").read_text())
+        t = s.get("totals") or {}
+        doc.update({k: t.get(k) for k in ("paid_calls_total", "credits_est_if_billed")})
+    except Exception:
+        pass
+    for p in (Path(run_dir) / ".work" / "dry_run.json", _dry_root() / f"{ca.lower()}.json"):
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True); p.write_text(json.dumps(doc, indent=1))
+        except OSError:
+            pass
+
+
+def find_dry_run(run_dir, ca: str):
+    for p in (Path(run_dir) / ".work" / "dry_run.json", _dry_root() / f"{(ca or '').lower()}.json"):
+        try:
+            d = json.loads(p.read_text())
+            if d.get("ca") == (ca or "").lower():
+                return d
+        except Exception:
+            continue
+    return None
