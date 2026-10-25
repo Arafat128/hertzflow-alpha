@@ -2857,7 +2857,7 @@ def apply_data_gaps(skeleton: dict, rule11: dict | None) -> dict:
     if breaker:
         gaps.append({"section": "*", "reason": "credit breaker open (PAID_BALANCE_ZERO / budget)"})
     if sc and int(sc.get("successful_calls") or 0) == 0:
-        gaps.append({"section": "*", "reason": ("dry-run: no paid calls sent" if mode != "live"
+        gaps.append({"section": "*", "reason": (f"{mode} mode: no paid calls answered" if mode != "live"
                                                  else "0 successful paid Surf calls")})
     if rule11 and rule11.get("_trace_error"):
         gaps.append({"section": "rule_11", "reason": rule11["_trace_error"][:200]})

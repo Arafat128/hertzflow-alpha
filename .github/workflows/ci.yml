@@ -1,0 +1,19 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      BINANCE_ALPHA_NO_AUTO_UPDATE: "1"
+      HF_API_MODE: count          # never a live Surf call in CI (no keys configured)
+      HF_RPC_OFFLINE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.13"}
+      - run: pip install -r skills/hertzflow/requirements-dev.txt
+      - name: unit tests (0 credits, surf blocked by conftest)
+        working-directory: skills/hertzflow/alpha/v06
+        run: python -m pytest -q tests
+      # Smoke (dry-run goldens + emulate_zero_balance) needs the free public APIs;
+      # run manually: HF_SMOKE=1 python -m pytest -q tests/smoke

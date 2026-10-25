@@ -172,7 +172,7 @@ def build(run: Path, out: Path | None, brief: Path, assets: Path, force: bool, r
     cov += (f'<p class="b sm" style="font-family:\'IBM Plex Mono\',monospace">CA {esc(meta.get("contract_address", ""))} · '
             f'Alpha listing {esc(str(meta.get("alpha_listing_date_utc")))} UTC</p>')
     if sk.get("_data_gaps"):
-        cov += '<p class="b sm r"><b>Data gaps:</b> ' + "; ".join(esc(g.get("why", "")) for g in sk["_data_gaps"]) + "</p>"
+        cov += '<p class="b sm r"><b>Data gaps:</b> ' + "; ".join(esc(g.get("reason") or g.get("why", "")) for g in sk["_data_gaps"]) + "</p>"
     pages.append(("Cover", cov))
     for name, lines in secs:
         s = slug(name)

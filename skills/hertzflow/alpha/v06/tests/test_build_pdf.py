@@ -7,7 +7,7 @@ def _run(tmp):
     (tmp / ".work").mkdir(); (tmp / "frames").mkdir()
     (tmp / ".work" / "skeleton.json").write_text(json.dumps({"meta": {"symbol": "TST", "name": "Test", "chain": "BSC"},
         "chain_state": "UNKNOWN", "chain_state_risk_score": None, "_no_data": True,
-        "_data_gaps": [{"section": "*", "why": "0 successful paid calls"}]}))
+        "_data_gaps": [{"section": "*", "reason": "0 successful paid calls"}]}))
     (tmp / "frames" / "TST-00-cover.png").write_bytes(b"\x89PNG")
     (tmp / "frames" / "TST-01-chip-snapshot.png").write_bytes(b"\x89PNG")
     md = "# T\n## 3 FACTS\n" + "\n".join(f"{i}. **fact** {'x'*300}" for i in range(1, 12)) + \

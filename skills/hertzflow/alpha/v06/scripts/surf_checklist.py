@@ -42,7 +42,7 @@ def build(run: Path, extra=()):
                      + "; ".join(f"{short(c['note'].split(' · ')[0])} {c['skeleton']:,.0f}→{c['rpc']:,.0f}" for c in drift[:6])
                      + ". Confirm the moves and where the tokens went.")
     for g in sk.get("_data_gaps") or []:
-        n += 1; lines.append(f"{n}. [ ] Data gap ({g.get('section')}): {g.get('why')} — Surf: what is the real value?")
+        n += 1; lines.append(f"{n}. [ ] Data gap ({g.get('section')}): {g.get('reason') or g.get('why')} — Surf: what is the real value?")
     for t in list(OFFCHAIN) + list(extra):
         n += 1; lines.append(f"{n}. [ ] {t}")
     out = run / "surf-verify-checklist.auto.md"

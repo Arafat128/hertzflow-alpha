@@ -25,7 +25,7 @@ def test_verify_and_checklist(tmp_path, monkeypatch):
     sk = {"meta": {"symbol": "TST", "contract_address": CA, "coingecko_platforms": {"binance-smart-chain": CA},
           "chain_lp_realtime": {"binance-smart-chain": {"top_holders_classified": {"unclassified": {"top": [
               {"addr": SAFE, "balance": 100.0}, {"addr": EOA, "balance": 80.0}]}}}}},
-          "_data_gaps": [{"section": "rule_11", "why": "trace failed"}]}
+          "_data_gaps": [{"section": "rule_11", "reason": "trace failed"}]}
     (tmp_path / ".work" / "skeleton.json").write_text(json.dumps(sk))
     d = rv.verify(tmp_path, do_mint=False, do_alpha=False)
     st = {(c["check"], c["note"].split(" · ")[0]): c for c in d["checks"]}
