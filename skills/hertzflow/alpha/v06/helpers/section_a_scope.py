@@ -543,6 +543,24 @@ _EVM_RPC_URLS = {
 }
 
 
+def resolve_decimals(rpc_dec, alpha_dec, solana: bool = False):
+    """Perseus fix 6. Returns (decimals|None, source, warning|None).
+    RPC wins; Alpha API is the free fallback; mismatch and default-18 are
+    loud. None → chain_router default 18 (flagged as unverified)."""
+    if rpc_dec is not None:
+        if alpha_dec is not None and int(alpha_dec) != int(rpc_dec):
+            return int(rpc_dec), "rpc", (f"RPC decimals()={rpc_dec} != Alpha API decimals={alpha_dec}; "
+                                         f"using RPC — verify amounts")
+        return int(rpc_dec), ("rpc+alpha" if alpha_dec is not None else "rpc"), None
+    if alpha_dec is not None:
+        return int(alpha_dec), "alpha_api", ("RPC decimals() failed; using Alpha API decimals="
+                                             f"{alpha_dec}")
+    if solana:
+        return None, "unverified_default_18", "SPL decimals unavailable; amounts assume 18 — UNVERIFIED"
+    return None, "unverified_default_18", ("RPC decimals() failed and Alpha API has none; amounts "
+                                           "assume 18 — UNVERIFIED, re-check before publishing")
+
+
 def _fetch_evm_token_decimals(ca: str, chain_id: str | int | None) -> int | None:
     """v0.9.7 fix #2: read ERC20 `decimals()` via public EVM RPC.
 
@@ -1576,6 +1594,18 @@ def run(ca: str) -> dict[str, Any]:
         # Failure-safe: any RPC error leaves chain_decimals=None → router
         # falls back to 18 → v0.9.6 behavior preserved.
         chain_decimals = _fetch_evm_token_decimals(ca_lower, chain_id)
+    # Perseus fix 6: never silently fall back to 18 ($ELIZAOS needed a hand
+    # patch). Cross-check RPC decimals() against the free Alpha API field.
+    _alpha_dec = None
+    try:
+        _alpha_dec = int((entry or {}).get("decimals")) if (entry or {}).get("decimals") not in (None, "") else None
+    except (TypeError, ValueError, NameError):
+        _alpha_dec = None
+    chain_decimals, decimals_source, decimals_warning = resolve_decimals(
+        chain_decimals, _alpha_dec, solana=_solana_ok)
+    if decimals_warning:
+        import sys as _sys
+        print(f"[section_a] DECIMALS WARN: {decimals_warning}", file=_sys.stderr)
 
     # v0.9.7: propagate to chain_router so every helper's SQL builder uses
     # the correct divisor instead of hardcoded `/1e18`.
@@ -1642,6 +1672,8 @@ def run(ca: str) -> dict[str, Any]:
         # inflationary mints — JELLYJELLY shipped 999,966,701 on-chain vs
         # 999,999,099 Alpha). None on EVM and on Solana RPC fallback.
         "chain_decimals": chain_decimals,
+        "decimals_source": decimals_source,
+        "decimals_warning": decimals_warning,
         "chain_total_supply_ui": chain_total_supply_ui,
     }
 

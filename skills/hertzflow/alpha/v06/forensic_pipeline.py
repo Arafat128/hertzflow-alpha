@@ -2160,6 +2160,8 @@ def build_skeleton(
             # next to the Alpha API snapshot when they differ. Both None on
             # EVM and on Solana RPC fallback.
             "chain_decimals": scope.get("chain_decimals"),
+            "decimals_source": scope.get("decimals_source"),
+            "decimals_warning": scope.get("decimals_warning"),
             "chain_total_supply_ui": scope.get("chain_total_supply_ui"),
         },
 
