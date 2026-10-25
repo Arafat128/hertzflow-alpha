@@ -98,6 +98,13 @@ def _eth_get_code(addr: str) -> tuple[str, int]:
         "params": [addr, "latest"],
         "id": 1,
     }
+    try:  # Perseus: health-ordered rpcs.yaml pool, single curl kept as fallback
+        import rpc_pool as _rp
+        _res, _u = _rp.call("bsc", "eth_getCode", [addr, "latest"])
+        if isinstance(_res, str) and _res.startswith("0x"):
+            return _res, (len(_res) - 2) // 2
+    except Exception:
+        pass
     try:
         proc = subprocess.run(
             ["curl", "-sS", "-X", "POST", "https://bsc-dataseed.binance.org",

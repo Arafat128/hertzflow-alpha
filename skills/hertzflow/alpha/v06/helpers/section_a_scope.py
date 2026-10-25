@@ -578,7 +578,11 @@ def _fetch_evm_token_decimals(ca: str, chain_id: str | int | None) -> int | None
     if not ca:
         return None
     chain_key = str(chain_id) if chain_id is not None else "56"
-    rpc_urls = _EVM_RPC_URLS.get(chain_key)
+    try:  # Perseus: rpcs.yaml, health-ordered; hardcoded map is the fallback
+        import rpc_pool as _rp
+        rpc_urls = _rp.urls(chain_key) or _EVM_RPC_URLS.get(chain_key)
+    except Exception:
+        rpc_urls = _EVM_RPC_URLS.get(chain_key)
     if not rpc_urls:
         return None
     payload = json.dumps({

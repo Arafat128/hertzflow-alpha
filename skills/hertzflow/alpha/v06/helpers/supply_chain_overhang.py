@@ -103,6 +103,13 @@ _RPC_BY_PREFIX: dict[str, list[str]] = {
     "optimism": ["https://mainnet.optimism.io", "https://optimism.publicnode.com"],
 }
 
+try:  # Perseus: prefer rpcs.yaml (health-ordered at load); dict above = fallback
+    import rpc_pool as _rp
+    for _p in list(_RPC_BY_PREFIX):
+        _RPC_BY_PREFIX[_p] = _rp.urls(_p) or _RPC_BY_PREFIX[_p]
+except Exception:
+    pass
+
 # transfers table per surf prefix (the lineage SQL names the table explicitly so
 # it is unambiguous which chain it queries).
 _TRANSFERS_TABLE = {
