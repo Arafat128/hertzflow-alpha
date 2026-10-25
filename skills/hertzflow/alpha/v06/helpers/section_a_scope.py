@@ -153,6 +153,70 @@ def _surf_credit_add(credits: float, seconds: float, attempts: int = 1, success:
             _CREDIT_STATE["calls"] += 1
 
 
+# 2026-10-02 cost fix: answers that can never succeed on retry. Pre-fix every
+# error (incl. PAID_BALANCE_ZERO) was retried 4x with 1/3/7s backoff, so on a
+# zero balance each logical query cost 4 requests ($R2 baseline: 161 surf
+# invocations for 39 unique queries).
+_SURF_PERMANENT_MARKERS = (
+    "paid_balance_zero", "insufficient credit", "unauthorized", "forbidden",
+    "payment required", "hf_budget_exceeded", "invalid_request", "use_async_job",
+    "unknown table", "unknown identifier", "syntax error",
+)
+_SURF_TIMEOUT_MAX_ATTEMPTS = int(os.environ.get("HF_TIMEOUT_ATTEMPTS", "2"))
+
+
+def _is_permanent_surf_error(text: str) -> bool:
+    t = (text or "").lower()
+    return any(m in t for m in _SURF_PERMANENT_MARKERS)
+
+
+def _surf_error_obj(stdout: str | None) -> dict | None:
+    """2026-10-17: parse the FULL surf JSON error body (the old check only saw
+    the first 300 chars, so `use_async_job` / `retryable:false` past that
+    point were missed and non-retryable errors were resent 4x)."""
+    s = (stdout or "").strip()
+    if not s:
+        return None
+    i = s.find("{")
+    if i < 0:
+        return None
+    try:
+        doc, _ = json.JSONDecoder().raw_decode(s[i:])
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if isinstance(doc, dict) and isinstance(doc.get("error"), dict):
+        return doc["error"]
+    return None
+
+
+def _surf_error_class(err: dict | None) -> str | None:
+    """'rate' | 'permanent' | None (unknown → caller's old heuristics)."""
+    if not err:
+        return None
+    code = str(err.get("code", "")).upper()
+    if code == "RATE_LIMITED":
+        return "rate"
+    if err.get("retryable") is False or str(err.get("recommended_action", "")).lower() in (
+            "use_async_job", "contact_support") or _is_permanent_surf_error(code):
+        return "permanent"
+    return None
+
+
+def _surf_rate_backoff(attempt: int, err: dict | None) -> float:
+    import random as _r
+    ra = None
+    for k, scale in (("retry_after", 1.0), ("retry_after_ms", 0.001)):
+        try:
+            if err and err.get(k) is not None:
+                ra = float(err[k]) * scale
+                break
+        except (TypeError, ValueError):
+            pass
+    if ra is None:
+        ra = min(2 ** attempt, 16)
+    return min(ra, 30.0) + _r.uniform(0, 1.0 + 0.5 * attempt)
+
+
 def _run_surf_with_retry(
     cmd: list[str],
     stdin: str | None = None,
@@ -185,6 +249,8 @@ def _run_surf_with_retry(
     seconds_total = 0.0
     for attempt in range(1, max_attempts + 1):
         attempts_billed += 1
+        _err_cls = None
+        _err_obj = None
         t0 = time.perf_counter()
         try:
             kwargs: dict[str, Any] = {
@@ -195,10 +261,15 @@ def _run_surf_with_retry(
             }
             if stdin is not None:
                 kwargs["input"] = stdin
+            else:
+                # 2026-10-17: never inherit an open stdin pipe (surf blocks on it)
+                kwargs["stdin"] = subprocess.DEVNULL
             proc = subprocess.run(cmd, **kwargs)
         except (subprocess.TimeoutExpired, OSError) as e:
             last_err = f"subprocess_error: {str(e)[:120]}"
             seconds_total += time.perf_counter() - t0
+            if isinstance(e, subprocess.TimeoutExpired) and attempt >= _SURF_TIMEOUT_MAX_ATTEMPTS:
+                break   # 2026-10-02: cap hung-request retries (was 4)
         else:
             seconds_total += time.perf_counter() - t0
             if proc.returncode != 0:
@@ -207,7 +278,10 @@ def _run_surf_with_retry(
                 # 真实错误在 stdout, 之前只读 stderr → 错误吞掉成 "exit_4:" 误导.
                 # Fix: 优先 stderr (有则用), 否则 fall through stdout.
                 _err_raw = (proc.stderr or "").strip() or (proc.stdout or "").strip()
-                last_err = f"exit_{proc.returncode}: {_err_raw[:300]}"
+                _err_obj = _surf_error_obj(proc.stdout)
+                _err_cls = _surf_error_class(_err_obj)
+                _code = f"[{_err_obj.get('code')}] " if _err_obj else ""
+                last_err = f"exit_{proc.returncode}: {_code}{_err_raw[:300]}"
             else:
                 try:
                     doc = json.loads(proc.stdout)
@@ -215,6 +289,8 @@ def _run_surf_with_retry(
                     last_err = f"json_decode: {str(e)[:120]}"
                 else:
                     if isinstance(doc, dict) and doc.get("error"):
+                        _err_obj = doc["error"] if isinstance(doc["error"], dict) else None
+                        _err_cls = _surf_error_class(_err_obj)
                         last_err = f"surf_error: {str(doc['error'])[:120]}"
                     else:
                         # v0.9.4 credit accounting: success path. credits_used
@@ -232,6 +308,13 @@ def _run_surf_with_retry(
                             attempts=attempts_billed, success=True,
                         )
                         return doc, None
+        # 2026-10-02: permanent (billing/auth/budget/invalid SQL) → stop now.
+        # 2026-10-17: also any error the full JSON marks retryable:false.
+        if _err_cls == "permanent" or _is_permanent_surf_error(last_err):
+            break
+        if _err_cls == "rate" and attempt < max_attempts:
+            time.sleep(_surf_rate_backoff(attempt, _err_obj))
+            continue
         # transient — backoff and retry. 1s, 3s, 7s (cap)
         if attempt < max_attempts:
             time.sleep(min(2 ** attempt - 1, 7))
@@ -784,7 +867,13 @@ def fetch_realtime_token_info_via_surf(
     if not ca_lower:
         return fallback
 
-    _STOP = {"on", "of", "the", "a", "an", "and", "&", "by", "for", "in"}
+    _STOP = {"on", "of", "the", "a", "an", "and", "&", "by", "for", "in",
+             # 2026-10-02: generic words are never a project's short name and
+             # can't pass the CA/symbol verify below — each was a wasted paid
+             # project-detail call (e.g. "R2 Protocol" → q="Protocol").
+             "protocol", "network", "token", "coin", "finance", "labs", "chain",
+             "dao", "swap", "exchange", "foundation", "project", "ai", "fi",
+             "defi", "official", "world", "global"}
     queries: list[str] = []
     if symbol:
         queries.append(symbol)             # ticker — canonical for Alpha

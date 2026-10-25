@@ -222,6 +222,17 @@ def _label_text(info: dict[str, Any]) -> str:
     return " | ".join(p for p in parts if p)
 
 
+def _clamp_floor(date_floor: str | None) -> str:
+    """2026-10-17: clamp to Surf's 365-day large-table window (CT run sent
+    block_date >= '2025-09-30' on ethereum_transfers → INVALID_REQUEST)."""
+    from datetime import date as _d, timedelta as _td
+    safe = (_d.today() - _td(days=364)).isoformat()
+    try:
+        return max(str(date_floor or safe)[:10], safe)
+    except Exception:
+        return safe
+
+
 def _funded_by_seed_one_hop(
     prefix: str, supply_ca: str, eoas: list[str], seed: set[str], date_floor: str,
 ) -> set[str]:
@@ -233,12 +244,15 @@ def _funded_by_seed_one_hop(
     table = _TRANSFERS_TABLE.get(prefix)
     if not table:
         return set()
-    eoa_list = ",".join(f"'{a}'" for a in eoas)
-    seed_list = ",".join(f"'{a}'" for a in seed)
+    # 2026-10-17: lowercase literals + plain columns (lower() on address
+    # predicates is refused by Surf's sync endpoint); 365-day floor clamped.
+    date_floor = _clamp_floor(date_floor)
+    eoa_list = ",".join(f"'{a.lower()}'" for a in eoas)
+    seed_list = ",".join(f"'{a.lower()}'" for a in seed)
     sql = (
-        f'SELECT DISTINCT lower("to") AS a FROM {table} '
+        f'SELECT DISTINCT "to" AS a FROM {table} '
         f"WHERE contract_address='{supply_ca.lower()}' "
-        f'AND lower("to") IN ({eoa_list}) AND lower("from") IN ({seed_list}) '
+        f'AND "to" IN ({eoa_list}) AND "from" IN ({seed_list}) '
         f"AND block_date >= '{date_floor}'"
     )
     try:
@@ -298,17 +312,17 @@ def _trace_operator_forward(
         if not frontier:
             break
         front = sorted(frontier)[:300]  # cap IN-list size
-        from_list = ",".join(f"'{a}'" for a in front)
+        from_list = ",".join(f"'{a.lower()}'" for a in front)
         # adversarial review MEDIUM: require at least ONE large transfer
         # (max(amt) >= min_edge), not just many small ones summing over — a
         # market-maker / exchange-deposit cluster receiving lots of dust must not
         # cross the operator-edge threshold by aggregation alone.
         sql = (
-            f'SELECT lower("to") AS a, '
+            f'SELECT "to" AS a, '
             f'sum(toFloat64(toDecimal256(amount_raw,0))/{df}) AS s, '
             f'max(toFloat64(toDecimal256(amount_raw,0))/{df}) AS mx '
             f"FROM {table} WHERE contract_address='{supply_ca.lower()}' "
-            f'AND lower("from") IN ({from_list}) AND block_date >= \'{date_floor}\' '
+            f'AND "from" IN ({from_list}) AND block_date >= \'{_clamp_floor(date_floor)}\' '
             f"GROUP BY a HAVING s >= {min_edge} AND mx >= {min_edge} ORDER BY s DESC LIMIT 1000"
         )
         try:

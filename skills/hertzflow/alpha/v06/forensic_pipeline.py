@@ -1237,20 +1237,38 @@ def build_skeleton(
             d for d in (_ht_disco.get("dumpers") or [])
             if not d.get("is_excluded")
         ]
+        _ht_prev = _ht_disco.get("summary", {}) or {}
+        # 2026-10-17: carry the detector status so a failed scan reads
+        # UNKNOWN/PARTIAL (with an error count), never "0 operator dumpers".
+        _ht_status = _ht_disco.get("status") or _ht_prev.get("status") or (
+            "UNKNOWN" if _ht_disco.get("_error") else "OK")
+        _ht_disco["status"] = _ht_status
         _ht_disco["summary"] = {
             "n_dumpers": len(_operator_dumpers),
             "total_throughput": sum(d.get("total_in", 0) for d in _operator_dumpers),
-            "n_dumpers_pre_filter": _ht_disco.get("summary", {}).get("n_dumpers", 0),
+            "n_dumpers_pre_filter": _ht_prev.get("n_dumpers", 0),
+            "status": _ht_status,
+            "n_chunk_errors": _ht_disco.get("n_chunk_errors", _ht_prev.get("n_chunk_errors", 0)),
+            "n_chunks": _ht_disco.get("n_chunks", _ht_prev.get("n_chunks")),
         }
         funding_attribution["high_throughput_dumpers"] = _ht_disco
         import sys as _sys
-        print(
-            f"[funding_attribution] high_throughput_dumpers: "
-            f"{len(_operator_dumpers)} operator dumpers "
-            f"(pre-infra-filter {len((_ht_disco.get('dumpers') or []))}), "
-            f"total throughput {sum(d.get('total_in', 0) for d in _operator_dumpers):,.0f} tokens",
-            file=_sys.stderr,
-        )
+        if _ht_status != "OK":
+            print(
+                f"[funding_attribution] high_throughput_dumpers: {_ht_status} — "
+                f"{_ht_disco['summary']['n_chunk_errors']}/{_ht_disco['summary']['n_chunks'] or '?'} "
+                f"chunks errored (count NOT 0; scan incomplete): "
+                f"{str(_ht_disco.get('_error') or '')[:160]}",
+                file=_sys.stderr,
+            )
+        else:
+            print(
+                f"[funding_attribution] high_throughput_dumpers: "
+                f"{len(_operator_dumpers)} operator dumpers "
+                f"(pre-infra-filter {len((_ht_disco.get('dumpers') or []))}), "
+                f"total throughput {sum(d.get('total_in', 0) for d in _operator_dumpers):,.0f} tokens",
+                file=_sys.stderr,
+            )
 
     # v0.7.24a.1: resolve Arkham labels for top destinations of mining-fed
     # v0.7.24e.2 (A3): destination labels deferred to consolidated batch at
@@ -1298,7 +1316,18 @@ def build_skeleton(
             funding_attribution["cex_fanout_hubs"] = _fanout_disco
             import sys as _sys
             _fo_sum = _fanout_disco.get("summary", {})
-            print(
+            _fo_status = _fanout_disco.get("status") or _fo_sum.get("status") or (
+                "UNKNOWN" if _fanout_disco.get("_error") else "OK")
+            if _fo_status != "OK":
+                print(
+                    f"[funding_attribution] cex_fanout_hubs: {_fo_status} — "
+                    f"{_fo_sum.get('n_chunk_errors', '?')}/{_fo_sum.get('n_chunks', '?')} "
+                    f"chunks errored (count NOT 0; scan incomplete): "
+                    f"{str(_fanout_disco.get('_error') or '')[:160]}",
+                    file=_sys.stderr,
+                )
+            else:
+              print(
                 f"[funding_attribution] cex_fanout_hubs: "
                 f"{_fo_sum.get('n_confirmed_hubs', 0)} confirmed CEX-source hubs "
                 f"(from {_fo_sum.get('n_candidate_hubs', 0)} candidates), "
@@ -2915,10 +2944,39 @@ def main() -> int:
     # must be called with same --lang for consistency.
     ap.add_argument("--lang", default="zh", choices=("zh", "en"),
                     help="Pipeline output language for labels (default: zh).")
+    # 2026-10-02 cost controls (helpers/api_gateway.py). Equivalent env vars:
+    # HF_API_MODE=count, HF_MAX_CREDITS, HF_MAX_PAID_CALLS, HF_CACHE=0.
+    ap.add_argument("--dry-run", "--count", dest="dry_run", action="store_true",
+                    help="Plan only: send NO paid surf calls; print planned calls + "
+                         "estimated credits (cache hits are still served).")
+    ap.add_argument("--max-credits", type=int, default=None,
+                    help="Hard per-run surf credit budget (default 400).")
+    ap.add_argument("--max-calls", type=int, default=None,
+                    help="Hard per-run paid surf call budget (default 150).")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="Bypass the response cache (/workspace/hertzflow-cache).")
     args = ap.parse_args()
+    if args.dry_run:
+        os.environ["HF_API_MODE"] = "count"
+    if args.max_credits is not None:
+        os.environ["HF_MAX_CREDITS"] = str(args.max_credits)
+    if args.max_calls is not None:
+        os.environ["HF_MAX_PAID_CALLS"] = str(args.max_calls)
+    if args.no_cache:
+        os.environ["HF_CACHE"] = "0"
+    if os.environ.get("HF_API_MODE", "live") != "live":
+        # never let a dry-run trigger `npx skills update` (it would also
+        # overwrite these local cost fixes).
+        os.environ.setdefault("BINANCE_ALPHA_NO_UPDATE_CHECK", "1")
 
     # Set lang BEFORE build_skeleton() so all helpers using t() see correct lang.
     sys.path.insert(0, str(Path(__file__).parent / "helpers"))
+    try:
+        import api_gateway as _api_gateway
+        _api_gateway.install()
+    except Exception as _e:  # gateway must never block the pipeline
+        _api_gateway = None
+        print(f"[api_gateway] not installed: {_e}", file=sys.stderr)
     from i18n import set_lang
     set_lang(args.lang)
 
@@ -2988,6 +3046,8 @@ def main() -> int:
     # surf.exe x86_64 emulation) being interrupted by the user no longer
     # leaves them with zero durable output. After all sections finish, the
     # final assembled skeleton is written to skeleton.json as before.
+    if _api_gateway is not None:
+        _api_gateway.install(skeleton_path.parent)   # ledger → <run>/.work/
     partial_path = skeleton_path.parent / "skeleton_partial.json"
     # audit HIGH#3: clear any stale checkpoint from a prior interrupted
     # run so the file `_last_section_completed` always reflects the CURRENT

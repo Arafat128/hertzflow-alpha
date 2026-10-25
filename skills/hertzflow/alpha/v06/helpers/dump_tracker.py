@@ -91,7 +91,7 @@ from typing import Any
 # surf calls than max_workers=4 would anyway. Override via env if a
 # future token's fan-out spikes credit usage past safe levels.
 DUMP_TRACKER_WORKERS = max(1, int(
-    os.environ.get("BINANCE_ALPHA_DUMP_TRACKER_WORKERS", "4")
+    os.environ.get("BINANCE_ALPHA_DUMP_TRACKER_WORKERS", "3")  # 2026-10-17: was 4
 ))
 
 sys.path.insert(0, str(Path(__file__).parent))

@@ -1167,7 +1167,7 @@ def run_backward_trace(
         # audit M5: keep the env worker-throttle escape hatch even
         # when matching v0.7.22 baseline cap. 8 is the safe default; ops
         # can lower via `BINANCE_ALPHA_STEP4_WORKERS` if surf 429s.
-        step4_workers = int(os.environ.get("BINANCE_ALPHA_STEP4_WORKERS", "8"))
+        step4_workers = int(os.environ.get("BINANCE_ALPHA_STEP4_WORKERS", "3"))  # 2026-10-17: was 8 (RATE_LIMITED)
 
         def _step4_one(task: tuple[int, str, int, str, str]) -> dict[str, Any]:
             idx, dumper, _depth, cf, cc = task

@@ -507,8 +507,10 @@ def query_mining_fed_outflows(
         }
 
     if not doc_sell and not doc_transfers:
+        _sum = _empty_mfo_summary()
+        _sum.update({"status": "UNKNOWN", "n_query_errors": 2})
         return {
-            "per_addr": {}, "summary": _empty_mfo_summary(),
+            "per_addr": {}, "status": "UNKNOWN", "summary": _sum,
             "_error": f"both queries failed: sell={err_sell}; transfers={err_transfers}",
             "_debug": {"sql_truncated_addr_n": truncated_n,
                        "lookup_window_floor": date_floor_clamped},
@@ -923,9 +925,15 @@ def discover_high_throughput_dumpers(
     # vanishes from the result. Match v0.9.3 strictness: any chunk error
     # → empty result + _error so caller behaves the same as before.
     if errs or truncated_chunks > 0:
+        # 2026-10-17: never let a failed scan read as "0 dumpers".
+        _st = "UNKNOWN" if len(errs) >= len(chunks) else "PARTIAL"
         return {
-            "dumpers": [], "summary": {
+            "dumpers": [], "status": _st,
+            "n_chunk_errors": len(errs), "n_chunks": len(chunks),
+            "summary": {
                 "n_dumpers": 0, "total_throughput": 0.0,
+                "status": _st, "n_chunk_errors": len(errs),
+                "n_chunks_truncated": truncated_chunks, "n_chunks": len(chunks),
             },
             "_error": (
                 f"{len(errs)}/{len(chunks)} chunks errored, "
@@ -985,8 +993,9 @@ def discover_high_throughput_dumpers(
             total_through += d["total_in"]
 
     return {
-        "dumpers": dumpers,
+        "dumpers": dumpers, "status": "OK",
         "summary": {
+            "status": "OK",
             "n_dumpers": sum(1 for d in dumpers if not d["is_excluded"]),
             "total_throughput": total_through,
         },
@@ -1138,8 +1147,15 @@ def discover_cex_fanout_hubs(
     # _error. v0.9.3 single-shot semantics. A capped chunk full of junk
     # pairs would silently mask a real operator hub in Python merge.
     if errs_p1 or truncated_p1 > 0:
+        # 2026-10-17: UNKNOWN / PARTIAL, not "0 hubs".
+        _st = "UNKNOWN" if len(errs_p1) >= len(chunks) else "PARTIAL"
+        _sum = _empty_fanout_summary()
+        _sum.update({"status": _st, "n_chunk_errors": len(errs_p1),
+                     "n_chunks_truncated": truncated_p1, "n_chunks": len(chunks)})
         return {
-            "hubs": [], "summary": _empty_fanout_summary(),
+            "hubs": [], "status": _st,
+            "n_chunk_errors": len(errs_p1), "n_chunks": len(chunks),
+            "summary": _sum,
             "_error": (
                 f"phase1 {len(errs_p1)}/{len(chunks)} chunks errored, "
                 f"{truncated_p1}/{len(chunks)} chunks truncated at LIMIT; "
@@ -1570,8 +1586,9 @@ def discover_cex_fanout_hubs(
                 all_net_structured_recipients.add(a)
 
     return {
-        "hubs": confirmed_hubs,
+        "hubs": confirmed_hubs, "status": "OK",
         "summary": {
+            "status": "OK",
             "n_confirmed_hubs": len(confirmed_hubs),
             "n_candidate_hubs": len(hub_candidates),
             "total_cex_inflow_tokens": total_cex_inflow,

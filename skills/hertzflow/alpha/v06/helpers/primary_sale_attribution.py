@@ -286,7 +286,9 @@ def detect_primary_sale_pools(
     #    tokens distributed (materiality), not recipient count — a smaller-fan-out
     #    but high-value sale pool must not be crowded out by tiny dust senders.
     sql = (
-        'SELECT lower("from") AS src, count(DISTINCT lower("to")) AS n_recip, '
+        # 2026-10-17: plain address columns (stored lowercase); lower() on an
+        # address predicate/column forces Surf's async path (SYNC_QUERY_REQUIRES_ASYNC).
+        'SELECT "from" AS src, count(DISTINCT "to") AS n_recip, '
         f'sum(toFloat64(toDecimal256(amount_raw,0))/{_df}) AS amt, '
         'min(block_date) AS first_out '
         f"FROM {table} WHERE contract_address='{supply_ca}' {_win}"
@@ -350,13 +352,13 @@ def detect_primary_sale_pools(
     # truncate before the seed rows arrive — suppressing a real pool. Filtering to
     # seed funders keeps the result tiny and the ordering sum exact.
     if safe_in and seed:
-        in_list = ",".join("'%s'" % a for a in safe_in)
+        in_list = ",".join("'%s'" % a.lower() for a in safe_in)
         seed_list = ",".join("'%s'" % a for a in sorted(seed))
         frows = _run_sql(
-            'SELECT lower("to") AS pool, lower("from") AS funder, block_date AS bd, '
+            'SELECT "to" AS pool, "from" AS funder, block_date AS bd, '
             f'sum(toFloat64(toDecimal256(amount_raw,0))/{_df}) AS amt '
             f"FROM {table} WHERE contract_address='{supply_ca}' "
-            f'AND lower("to") IN ({in_list}) AND lower("from") IN ({seed_list}) {_fund_win}'
+            f'AND "to" IN ({in_list}) AND "from" IN ({seed_list}) {_fund_win}'
             "GROUP BY pool, funder, bd",
             max_rows=4000,
         )
@@ -384,10 +386,10 @@ def detect_primary_sale_pools(
     # 2. ATTRIBUTE each pool: recipient concentration + operator overlap.
     for p in sale_pools:
         rows = _run_sql(
-            'SELECT lower("to") AS r, '
+            'SELECT "to" AS r, '
             f'sum(toFloat64(toDecimal256(amount_raw,0))/{_df}) AS amt '
             f"FROM {table} WHERE contract_address='{supply_ca}' "
-            f"AND lower(\"from\")='{p['pool_addr']}' {_win}"
+            f"AND \"from\"='{str(p['pool_addr']).lower()}' {_win}"
             "GROUP BY r ORDER BY amt DESC LIMIT 1000",
             max_rows=1000,
         )

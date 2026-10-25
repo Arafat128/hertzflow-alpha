@@ -92,7 +92,7 @@ def chunked_dates(
 # onchain-sql calls before retry storms; 7 matches one bucket per worker
 # for the most common SKYAI-class range (13 months ÷ 90d ≈ 7 chunks).
 # Override via env for ARM Python / slow link debugging.
-_DEFAULT_WORKERS = int(os.environ.get("BINANCE_ALPHA_CHUNK_WORKERS", "7"))
+_DEFAULT_WORKERS = int(os.environ.get("BINANCE_ALPHA_CHUNK_WORKERS", "3"))  # 2026-10-17: was 7; Surf RATE_LIMITED above ~3 concurrent
 
 
 def parallel_run_chunked(

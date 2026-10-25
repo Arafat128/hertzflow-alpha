@@ -225,6 +225,58 @@ class SurfLabelsError(Exception):
     catch and degrade gracefully (probe is enrichment, not gate)."""
 
 
+_LABEL_CACHE_TTL = int(__import__("os").environ.get("HF_TTL_LABELS", str(7 * 86400)))
+
+
+def _label_cache_dir():
+    import os
+    from pathlib import Path
+    if os.environ.get("HF_CACHE", "1") == "0" or os.environ.get("HF_GATEWAY", "on") == "off":
+        return None
+    try:
+        from chain_router import get_active_chain
+        chain = get_active_chain()
+    except Exception:
+        chain = "_any"
+    return Path(os.environ.get("HF_CACHE_DIR", "/workspace/hertzflow-cache")) / "_labels" / chain
+
+
+def _label_cache_get(addrs: list[str]) -> dict[str, dict]:
+    import time
+    d = _label_cache_dir()
+    if d is None:
+        return {}
+    got: dict[str, dict] = {}
+    for a in addrs:
+        f = d / f"{a}.json"
+        try:
+            rec = json.loads(f.read_text(encoding="utf-8"))
+            if time.time() - rec.get("ts", 0) <= _LABEL_CACHE_TTL:
+                got[a] = rec["v"]
+        except Exception:
+            continue
+    return got
+
+
+def _label_cache_put(items: dict[str, dict]) -> None:
+    import os
+    import time
+    d = _label_cache_dir()
+    if d is None or not items:
+        return
+    # Never persist synthetic answers from dry-run / emulation modes.
+    if os.environ.get("HF_API_MODE", "live").lower() != "live":
+        return
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        for a, v in items.items():
+            tmp = d / f".{a}.tmp{os.getpid()}"
+            tmp.write_text(json.dumps({"ts": time.time(), "v": v}), encoding="utf-8")
+            os.replace(tmp, d / f"{a}.json")
+    except OSError:
+        pass
+
+
 def resolve_labels(addrs: Iterable[str], verbose: bool = False) -> dict[str, dict]:
     """Query `surf wallet-labels-batch` for the given addresses.
 
@@ -239,7 +291,8 @@ def resolve_labels(addrs: Iterable[str], verbose: bool = False) -> dict[str, dic
     # v0.7.21.7: chain-aware normalization. EVM lowercases for label-key match;
     # Solana base58 preserved as-is (case-sensitive). Invalid addrs dropped.
     addrs_l = [_norm_addr(a or "") for a in addrs]
-    addrs_l = [a for a in addrs_l if _addr_ok(a)]
+    # 2026-10-02: de-dupe (order kept) so repeated addresses don't eat batch slots.
+    addrs_l = list(dict.fromkeys(a for a in addrs_l if _addr_ok(a)))
     if not addrs_l:
         return {}
 
@@ -273,8 +326,18 @@ def resolve_labels(addrs: Iterable[str], verbose: bool = False) -> dict[str, dic
     CHUNK = 20
     n_ok = 0
     n_fail = 0
-    for i in range(0, len(addrs_l), CHUNK):
-        chunk = addrs_l[i:i + CHUNK]
+    # 2026-10-02 cost fix: per-address label cache (7d TTL). Five sections
+    # (l_distribution, funding_attribution x2, wallet_cluster_graph,
+    # supply_chain_overhang, primary_sales) each re-queried overlapping
+    # address sets; now only never-seen / expired addresses are sent.
+    cached = _label_cache_get(addrs_l)
+    for a, v in cached.items():
+        out[a] = v
+    if cached:
+        n_ok += 1
+    to_query = [a for a in addrs_l if a not in cached]
+    for i in range(0, len(to_query), CHUNK):
+        chunk = to_query[i:i + CHUNK]
         cmd = ["surf", "wallet-labels-batch", "--addresses", ",".join(chunk)]
         doc, err = _run_surf_with_retry(
             cmd, base_timeout=SURF_TIMEOUT_SECS, max_attempts=4
@@ -283,6 +346,7 @@ def resolve_labels(addrs: Iterable[str], verbose: bool = False) -> dict[str, dic
             n_fail += 1
             continue
         n_ok += 1
+        _chunk_ok = list(chunk)
         for row in doc.get("data") or []:
             addr = _norm_addr(row.get("address") or "")
             if not addr or addr not in out:
@@ -302,6 +366,7 @@ def resolve_labels(addrs: Iterable[str], verbose: bool = False) -> dict[str, dic
                 "classification": cls,
                 "confidence": confidence,
             }
+        _label_cache_put({a: out[a] for a in _chunk_ok})
 
     if n_ok == 0 and n_fail > 0:
         raise SurfLabelsError(

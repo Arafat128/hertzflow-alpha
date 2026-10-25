@@ -71,6 +71,10 @@ _BLOCK_DATE_RE = re.compile(
 # Match `today() - <N>` / `today()- <N>` — these are surf-safe by construction
 # as long as N <= 365. We require N <= 364 to be conservative (matches the
 # surf_constraints helper).
+_BETWEEN_RE = re.compile(
+    r"""block_date\s+BETWEEN\s+(?:toDate\(\s*)?['"](\d{4}-\d{2}-\d{2})['"]""",
+    re.IGNORECASE,
+)
 _TODAY_MINUS_RE = re.compile(
     r"""block_date\s*>=\s*today\(\)\s*-\s*(\d+)""",
     re.IGNORECASE,
@@ -124,6 +128,28 @@ def _check_surf_365_day_window(payload: str, input_path: str) -> dict | None:
                     ),
                 }
             }
+    # 2026-10-17: `block_date BETWEEN 'A' AND 'B'` — the lower bound A is
+    # subject to the same 364-day floor ($AGT rule_11 sent BETWEEN
+    # '2025-02-15' ... which the >= scan above never saw).
+    for m in _BETWEEN_RE.finditer(sql):
+        try:
+            d = date.fromisoformat(m.group(1))
+        except ValueError:
+            continue
+        if d < safe_floor:
+            return {
+                "error": {
+                    "code": "INVALID_REQUEST_GUARD",
+                    "retryable": False,
+                    "message": (
+                        f"surf 365-day window guard: SQL in {input_path} uses "
+                        f"block_date BETWEEN '{m.group(1)}' ... against a large "
+                        f"surf table, older than the 364-day safe floor "
+                        f"({safe_floor.isoformat()}). Clamp the floor with "
+                        f"helpers.surf_constraints.surf_safe_date_floor()."
+                    ),
+                }
+            }
     # `today() - N` forms — only accept N <= 364.
     for m in _TODAY_MINUS_RE.finditer(sql):
         try:
@@ -157,15 +183,80 @@ _PERMANENT_ERROR_MARKERS = (
     "invalid_request", "syntax", "unknown identifier", "does not exist",
     "doesn't exist", "illegal", "cannot parse", "missing column",
     "unknown table", "type mismatch",
+    # 2026-10-02 cost fix: billing / auth / budget answers never succeed on
+    # retry. Pre-fix, PAID_BALANCE_ZERO was "transient" → 4 attempts × 2
+    # subprocesses per query ($R2 run: 160 attempts, 0 successes, ~25 min).
+    "paid_balance_zero", "insufficient credit", "unauthorized", "forbidden",
+    "payment required", "hf_budget_exceeded",
+    # Surf docs (POST /v1/onchain/sql): "A synchronous timeout is
+    # non-retryable and returns recommended_action: use_async_job ... Do not
+    # resubmit the synchronous request automatically."
+    "use_async_job",
 )
+
+# 2026-10-02: client-side subprocess hang (>90s) retries. Was 4 (= up to
+# 6 min per stuck query; $R2 sections each took 373s this way). One retry
+# keeps resilience to a single dropped connection.
+_TIMEOUT_MAX_ATTEMPTS = int(os.environ.get("HF_TIMEOUT_ATTEMPTS", "2"))
+
+
+def _first_json(text: str):
+    """First JSON object in surf stdout. surf can append 'WARN: Got 429 ...'
+    after the body, which made json.loads fail (2026-10-17)."""
+    s = (text or "").strip()
+    try:
+        return json.loads(s)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    i = s.find("{")
+    if i < 0:
+        return None
+    try:
+        doc, _ = json.JSONDecoder().raw_decode(s[i:])
+        return doc
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _is_api_error_answer(text: str) -> bool:
+    """True when surf printed a JSON API error body (the server answered).
+    Re-sending the same SQL via stdin cannot change that answer, so the
+    @file→stdin fallback must not fire (it doubled every failing request)."""
+    doc = _first_json(text)
+    return isinstance(doc, dict) and isinstance(doc.get("error"), dict)
 
 
 def _is_transient_error(resp: dict) -> bool:
     """True if an error response is worth retrying (transient), False if it is
-    a permanent request/schema error that will never succeed on retry."""
+    a permanent request/schema error that will never succeed on retry.
+    2026-10-17: the full error object is consulted — retryable:false or
+    recommended_action use_async_job/contact_support is permanent."""
     err = resp.get("error", {})
+    if not isinstance(err, dict):
+        return True
+    if err.get("retryable") is False:
+        return False
+    if str(err.get("recommended_action", "")).lower() in ("use_async_job", "contact_support"):
+        return False
     blob = (str(err.get("code", "")) + " " + str(err.get("message", ""))).lower()
     return not any(m in blob for m in _PERMANENT_ERROR_MARKERS)
+
+
+def _retry_sleep(attempt: int, resp: dict) -> float:
+    """Jittered backoff; RATE_LIMITED honours retry_after / retry_after_ms."""
+    err = resp.get("error", {}) if isinstance(resp, dict) else {}
+    if isinstance(err, dict) and str(err.get("code", "")).upper() == "RATE_LIMITED":
+        ra = None
+        for k, scale in (("retry_after", 1.0), ("retry_after_ms", 0.001)):
+            try:
+                if err.get(k) is not None:
+                    ra = float(err[k]) * scale
+                    break
+            except (TypeError, ValueError):
+                pass
+        base = ra if ra is not None else min(2 ** attempt, 16)
+        return min(base, 30.0) + random.uniform(0, 1.0 + 0.5 * attempt)
+    return min(2 ** attempt - 1, 7) + random.uniform(0, 0.5 * attempt)
 
 
 def _run_one(input_path: str, max_attempts: int = 4) -> tuple[str, dict, float]:
@@ -229,9 +320,12 @@ def _run_one(input_path: str, max_attempts: int = 4) -> tuple[str, dict, float]:
         # existing retry/backoff handles it, then fails loud after
         # max_attempts instead of hanging.
         try:
-            # Attempt 1: @file form (older surf CLI / current alpha.40)
+            # 2026-10-17 hang fix: the `@file` form makes surf CLI 1.0.9 block
+            # reading an inherited open stdin pipe (every call in the $AGT /
+            # $POP runs hung 90s x2). Always send the JSON body via input=.
             proc = subprocess.run(
-                ["surf", "onchain-sql", f"@{input_path}"],
+                ["surf", "onchain-sql"],
+                input=payload,
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
                 check=False, timeout=_SURF_SUBPROCESS_TIMEOUT,
             )
@@ -241,7 +335,7 @@ def _run_one(input_path: str, max_attempts: int = 4) -> tuple[str, dict, float]:
             resp = {"error": {"code": "SURF_TIMEOUT",
                               "message": f"surf onchain-sql hung > {_SURF_SUBPROCESS_TIMEOUT}s (killed)"}}
             last_resp, last_elapsed = resp, elapsed
-            if attempt < max_attempts:
+            if attempt < min(max_attempts, _TIMEOUT_MAX_ATTEMPTS):
                 time.sleep(min(2 ** attempt - 1, 7) + random.uniform(0, 0.5 * attempt))
                 continue
             _record_credit(None, _seconds_total, _attempts_billed, success=False)
@@ -256,7 +350,7 @@ def _run_one(input_path: str, max_attempts: int = 4) -> tuple[str, dict, float]:
             "INVALID_REQUEST" in output and "Send a JSON object" in output
         ) or "not a JSON object" in output
 
-        if proc.returncode != 0 or surf_cli_mismatch:
+        if surf_cli_mismatch or (proc.returncode != 0 and not _is_api_error_answer(proc.stdout)):
             # v0.8.7.2: fall back to stdin-piped JSON, NO --json flag. surf
             # CLI's --json is now a global output-format flag (alias for
             # `-o json`) and is rejected by onchain-sql when the API spec
@@ -278,7 +372,7 @@ def _run_one(input_path: str, max_attempts: int = 4) -> tuple[str, dict, float]:
                 resp = {"error": {"code": "SURF_TIMEOUT",
                                   "message": f"surf onchain-sql (stdin) hung > {_SURF_SUBPROCESS_TIMEOUT}s (killed)"}}
                 last_resp, last_elapsed = resp, elapsed
-                if attempt < max_attempts:
+                if attempt < min(max_attempts, _TIMEOUT_MAX_ATTEMPTS):
                     time.sleep(min(2 ** attempt - 1, 7) + random.uniform(0, 0.5 * attempt))
                     continue
                 _record_credit(None, _seconds_total, _attempts_billed, success=False)
@@ -286,7 +380,11 @@ def _run_one(input_path: str, max_attempts: int = 4) -> tuple[str, dict, float]:
             elapsed = time.perf_counter() - t0
 
         _seconds_total += elapsed
-        if proc.returncode != 0:
+        if proc.returncode != 0 and _is_api_error_answer(proc.stdout):
+            # 2026-10-02: keep the server's error code (e.g. PAID_BALANCE_ZERO)
+            # so the permanent-error check below can see it.
+            resp = _first_json(proc.stdout)
+        elif proc.returncode != 0:
             resp: dict = {"error": {"code": "SURF_EXIT", "message": proc.stderr.strip() or proc.stdout.strip()[:500]}}
         else:
             try:
@@ -307,7 +405,7 @@ def _run_one(input_path: str, max_attempts: int = 4) -> tuple[str, dict, float]:
         # Transient — back off (with jitter) and retry.
         last_resp, last_elapsed = resp, elapsed
         if attempt < max_attempts:
-            time.sleep(min(2 ** attempt - 1, 7) + random.uniform(0, 0.5 * attempt))
+            time.sleep(_retry_sleep(attempt, resp))
 
     _record_credit(None, _seconds_total, _attempts_billed, success=False)
     return (input_path, last_resp, last_elapsed)
@@ -337,11 +435,11 @@ def _record_credit(resp: dict | None, seconds: float, attempts: int, success: bo
         pass
 
 
-def run_parallel(input_paths: list[str], max_workers: int = 8) -> dict[str, dict]:
+def run_parallel(input_paths: list[str], max_workers: int = int(os.environ.get("HF_SQL_WORKERS", "3"))) -> dict[str, dict]:
     """Run all input queries in parallel. Returns {input_path: response_json}.
 
-    max_workers caps concurrency. Surf's server side throttles past 8 — keep
-    default unless you've verified your account tier supports more.
+    max_workers caps concurrency. 2026-10-17: default 3 (HF_SQL_WORKERS) —
+    Surf's per-owner ClickHouse slot budget answered RATE_LIMITED at 8.
     """
     results: dict[str, dict] = {}
     timings: dict[str, float] = {}
@@ -358,8 +456,8 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("inputs", nargs="+", help="Query JSON files (surf onchain-sql input format)")
     p.add_argument(
-        "--max-workers", type=int, default=8,
-        help="Max concurrent surf calls (default 8; surf throttles above this)",
+        "--max-workers", type=int, default=3,
+        help="Max concurrent surf calls (default 3; surf RATE_LIMITs above this)",
     )
     p.add_argument(
         "--out-suffix", default=".out.json",

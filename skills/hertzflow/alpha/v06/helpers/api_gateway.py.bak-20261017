@@ -1,0 +1,697 @@
+#!/usr/bin/env python3
+"""api_gateway.py — single choke point for every external API call the
+HertzFlow Alpha forensic pipeline makes (added 2026-10-02, cost optimisation).
+
+Every paid call in this pipeline goes through `subprocess.run(["surf", ...])`
+and every free call through `subprocess.run(["curl", ...])` (plus two
+`urllib.request.urlopen` sites). `install()` wraps `subprocess.run` once,
+in-process, so all ~40 call sites get the same behaviour without editing them:
+
+  * Response cache (disk) keyed by chain + CA + endpoint + canonical params
+    (+ SQL/stdin payload hash), per-endpoint TTL, stored under
+    /workspace/hertzflow-cache/<chain>/<ca>/<endpoint>/<sha>.json.
+    Only successful responses are cached. Identical concurrent calls are
+    serialised on a per-key lock so a duplicate waits for the first and is
+    served from cache (in-run dedupe).
+  * token-holders superset reuse: a cached top-100 for the same token/chain
+    answers a later top-50 request (section_f_holders ⊂ section_a).
+  * Credit circuit breaker: the first PAID_BALANCE_ZERO / insufficient
+    credit / UNAUTHORIZED answer trips it; every later paid cache-miss gets
+    the same error instantly (no network, no retry storm).
+  * Hard per-run budget: HF_MAX_CREDITS / HF_MAX_PAID_CALLS. A call that
+    would exceed it is refused with error code HF_BUDGET_EXCEEDED
+    (treated as permanent by the retry loops) and one clear log line.
+  * Modes (HF_API_MODE):
+      live    — default; real calls through cache/breaker/budget.
+      count   — dry-run: paid cache-misses are NOT sent; an empty success
+                is returned and the planned call + estimated credits are
+                logged. Free calls still run (0 credits) unless HF_OFFLINE=1.
+      emulate_zero_balance — paid misses answer PAID_BALANCE_ZERO like the
+                real API did on 2026-09-20/21 (measurement harness only).
+  * Ledger: one JSONL line per call (endpoint, provider, caller, cache hit,
+    credits) + api_summary.json, written to <run>/.work/.
+
+Disable completely with HF_GATEWAY=off.
+"""
+from __future__ import annotations
+
+import atexit
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import traceback
+from pathlib import Path
+
+_REAL_RUN = subprocess.run
+_INSTALLED = False
+_LOCK = threading.Lock()
+_KEY_LOCKS: dict[str, threading.Lock] = {}
+
+# ---------------------------------------------------------------------------
+# Credit price table (credits per call). Source per entry:
+#   "measured"  = meta.credits_used in real responses cached by the surf CLI
+#                 in ~/.surf/responses (2026-09-20 run).
+#   "docs"      = https://docs.asksurf.ai/pricing (fetched 2026-10-02):
+#                 Light 1 / Standard 2 / Heavy 4 ("Onchain SQL" = Heavy).
+#   "assumed"   = no figure found; conservative Heavy (4).
+# ---------------------------------------------------------------------------
+PRICE = {
+    "onchain-sql":         (4, "docs: Heavy tier (Onchain SQL) = 4 credits"),
+    "token-holders":       (1, "measured: meta.credits_used=1 (docs tier Token(partial) Standard=2)"),
+    "wallet-labels-batch": (1, "measured: meta.credits_used=1 (docs tier Wallet Standard=2)"),
+    "project-detail":      (1, "measured: meta.credits_used=1"),
+    "search-social-posts": (1, "docs: Social = Light 1 (endpoint absent from surf CLI 1.0.9)"),
+    "search-token":        (1, "docs: Search(partial) = Light 1"),
+    "search-project":      (1, "docs: Search(partial) = Light 1"),
+}
+DEFAULT_PRICE = (4, "assumed: unknown endpoint, priced as Heavy (4)")
+
+# Cache TTLs (seconds). Surf onchain tables refresh ~24h (docs: "Data refresh:
+# ~24 hours"), so a 6h SQL TTL never serves data older than the source itself
+# is likely to be. Labels change rarely. Free market endpoints stay short.
+TTL = {
+    "onchain-sql": 6 * 3600,
+    "token-holders": 3600,
+    "wallet-labels-batch": 7 * 86400,
+    "project-detail": 6 * 3600,
+    "search-social-posts": 86400,
+    "search-token": 86400,
+    "search-project": 86400,
+}
+FREE_TTL = [  # (host substring, ttl)
+    ("api.dexscreener.com", 300),
+    ("binance.com/bapi", 300),
+    ("api.binance.com/api/v3/exchangeInfo", 3600),
+    ("fapi.binance.com", 3600),
+    ("api.coingecko.com", 86400),
+    ("api.github.com", 86400),
+    ("bscscan.com/address", 7 * 86400),
+]
+FREE_RPC_TTL = 600
+
+# Sections whose output reaches the Product-1 brief (see REPORT.md field map).
+_BRIEF_CRITICAL = ("section_anomaly_72h", "section_a_scope", "section_f_holders",
+                   "dump_tracker.py", "section_liq", "surf_labels_probe")
+
+_ERR_BREAKER = ("PAID_BALANCE_ZERO", "insufficient credit", "\"UNAUTHORIZED\"",
+                "Payment Required")
+
+_HEX40 = re.compile(r"0x[0-9a-fA-F]{40}")
+_SQL_CHAIN = re.compile(r"agent\.([a-z]+)_", re.I)
+
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+class _State:
+    def __init__(self):
+        self.mode = os.environ.get("HF_API_MODE", "live").strip().lower()
+        self.cache_on = os.environ.get("HF_CACHE", "1") != "0"
+        self.breaker_on = os.environ.get("HF_BREAKER", "1") != "0"
+        self.budget_on = os.environ.get("HF_BUDGET", "1") != "0"
+        self.offline = os.environ.get("HF_OFFLINE", "0") == "1"
+        self.max_credits = _env_int("HF_MAX_CREDITS", 400)
+        self.max_calls = _env_int("HF_MAX_PAID_CALLS", 150)
+        self.reserve = _env_int("HF_BRIEF_RESERVE", 40)
+        self.cache_root = Path(os.environ.get("HF_CACHE_DIR", "/workspace/hertzflow-cache"))
+        self.run_dir = Path(os.environ.get("HF_RUN_DIR", ".")) if os.environ.get("HF_RUN_DIR") else None
+        self.breaker_tripped = None
+        self.budget_logged = False
+        self.paid_sent = 0
+        self.credits_actual = 0.0
+        self.credits_est = 0.0
+        self.credits_reserved = 0.0
+        self.planned_keys: set[str] = set()
+        self.planned_holders: dict = {}
+        self.records: list[dict] = []
+        self.t0 = time.time()
+
+
+S: _State | None = None
+
+
+# ---------------------------------------------------------------------------
+_GENERIC = {"_run_surf_with_retry", "_run_one", "_run_sql", "_curl_json", "_run",
+            "_surf_sql", "_run_surf", "_surf", "_post_rpc", "_rpc", "run_parallel"}
+
+
+def _caller() -> str:
+    """'module:function:line' of the business caller (generic retry/runner
+    wrappers are reported after a '<' so the real section is visible)."""
+    frames = []
+    for fr in reversed(traceback.extract_stack()[:-3]):
+        fn = fr.filename
+        if "api_gateway" in fn or fn.endswith("subprocess.py") or "threading" in fn \
+                or "concurrent" in fn:
+            continue
+        frames.append(f"{Path(fn).name}:{fr.name}:{fr.lineno}")
+        if fr.name not in _GENERIC:
+            break
+        if len(frames) >= 3:
+            break
+    via = ""
+    if threading.current_thread() is not threading.main_thread():
+        # Worker thread (parallel_surf pool): attribute to what the main
+        # thread is running right now (the section that fanned out).
+        try:
+            mf = sys._current_frames().get(threading.main_thread().ident)
+            for fr in reversed(traceback.extract_stack(mf)):
+                if any(x in fr.filename for x in ("api_gateway", "threading", "concurrent",
+                                                    "subprocess.py", "parallel_surf")):
+                    continue
+                via = f" [main:{Path(fr.filename).name}:{fr.name}]"
+                break
+        except Exception:
+            via = ""
+    if not frames:
+        return "?" + via
+    return frames[-1] + ("" if len(frames) == 1 else " < " + frames[0].split(":")[1]) + via
+
+
+def _payload_of(args, kwargs) -> str:
+    if kwargs.get("input") is not None:
+        p = kwargs["input"]
+        return p.decode() if isinstance(p, bytes) else str(p)
+    for a in args[2:]:
+        if isinstance(a, str) and a.startswith("@") and os.path.isfile(a[1:]):
+            try:
+                return Path(a[1:]).read_text(encoding="utf-8")
+            except OSError:
+                return ""
+    return ""
+
+
+def _canon_payload(p: str) -> str:
+    if not p:
+        return ""
+    try:
+        d = json.loads(p)
+        if isinstance(d, dict) and isinstance(d.get("sql"), str):
+            d["sql"] = re.sub(r"\s+", " ", d["sql"]).strip()
+        return json.dumps(d, sort_keys=True)
+    except Exception:
+        return re.sub(r"\s+", " ", p).strip()
+
+
+def _surf_parse(argv, kwargs):
+    endpoint = argv[1] if len(argv) > 1 else "?"
+    params: dict[str, str] = {}
+    rest = list(argv[2:])
+    i = 0
+    while i < len(rest):
+        a = str(rest[i])
+        if a.startswith("@"):
+            i += 1
+            continue
+        if a in ("--json", "--quiet", "--debug"):
+            i += 1
+            continue
+        if a.startswith("--"):
+            if "=" in a:
+                k, v = a[2:].split("=", 1)
+                params[k] = v
+                i += 1
+                continue
+            v = rest[i + 1] if i + 1 < len(rest) else ""
+            params[a[2:]] = str(v)
+            i += 2
+            continue
+        params.setdefault("_pos", "")
+        params["_pos"] += a + " "
+        i += 1
+    for k in ("address", "addresses"):
+        if k in params and params[k].startswith("0x"):
+            params[k] = params[k].lower()
+    payload = _canon_payload(_payload_of(argv, kwargs))
+    ca = None
+    chain = params.get("chain")
+    m = _HEX40.search(params.get("address", "") or "")
+    if m:
+        ca = m.group(0).lower()
+    if payload:
+        if not chain:
+            mc = _SQL_CHAIN.search(payload)
+            if mc:
+                chain = mc.group(1).lower()
+        if not ca:
+            mm = re.search(r"contract_address\s*=\s*'(0x[0-9a-fA-F]{40})'", payload)
+            if mm:
+                ca = mm.group(1).lower()
+    return endpoint, params, payload, (chain or "_any"), (ca or "_any")
+
+
+def _key(provider, endpoint, params, payload) -> str:
+    blob = json.dumps([provider, endpoint, sorted(params.items()), payload], sort_keys=True)
+    return hashlib.sha256(blob.encode()).hexdigest()[:32]
+
+
+def _cache_path(chain, ca, endpoint, key) -> Path:
+    return S.cache_root / chain / ca / endpoint / f"{key}.json"
+
+
+def _cache_get(path: Path, ttl: int):
+    try:
+        if not path.is_file():
+            return None
+        d = json.loads(path.read_text(encoding="utf-8"))
+        if time.time() - d.get("ts", 0) > ttl:
+            return None
+        return d
+    except Exception:
+        return None
+
+
+def _cache_put(path: Path, rec: dict):
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp%d" % threading.get_ident())
+        tmp.write_text(json.dumps(rec, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _completed(argv, kwargs, rc, out, err):
+    texty = kwargs.get("text") or kwargs.get("encoding") or kwargs.get("universal_newlines")
+    if not texty:
+        out = out.encode() if isinstance(out, str) else out
+        err = err.encode() if isinstance(err, str) else err
+    return subprocess.CompletedProcess(argv, rc, out if kwargs.get("capture_output") or kwargs.get("stdout") else None,
+                                       err if kwargs.get("capture_output") or kwargs.get("stderr") else None)
+
+
+def _is_ok_json(out: str):
+    try:
+        d = json.loads(out)
+    except Exception:
+        return None
+    if isinstance(d, dict) and d.get("error"):
+        return None
+    return d
+
+
+def _record(rec: dict):
+    with _LOCK:
+        S.records.append(rec)
+        if S.run_dir:
+            try:
+                p = S.run_dir / "api_ledger.jsonl"
+                p.parent.mkdir(parents=True, exist_ok=True)
+                with p.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
+
+
+def _log(msg):
+    print(f"[api_gateway] {msg}", file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Surf DATA API allowlist (2026-10-02). This skill must never call Surf's
+# Research/Chat API. Any surf subcommand outside this set is refused locally
+# (0 credits) and logged. Override only with HF_ALLOW_ANY_SURF=1.
+DATA_API_ALLOW = {
+    "onchain-sql", "onchain-sql-preflight", "onchain-sql-job-create",
+    "onchain-sql-job-get", "onchain-sql-job-results", "onchain-sql-job-cancel",
+    "token-holders", "wallet-labels-batch", "project-detail",
+    "search-project", "search-token", "search-social-posts",
+}
+
+
+def _handle_surf(argv, kwargs):
+    endpoint, params, payload, chain, ca = _surf_parse(argv, kwargs)
+    if endpoint not in DATA_API_ALLOW and os.environ.get("HF_ALLOW_ANY_SURF") != "1":
+        _log(f"DATA-API GUARD: refused surf '{endpoint}' (not a whitelisted Surf data endpoint; 0 credits)")
+        _record({"t": round(time.time() - S.t0, 2), "provider": "surf", "endpoint": endpoint,
+                 "outcome": "guard_refused", "est_credits": 0, "caller": _caller()})
+        return _completed(argv, kwargs, 2, "", f"refused by HertzFlow data-API guard: {endpoint}\n")
+    price, price_src = PRICE.get(endpoint, DEFAULT_PRICE)
+    key = _key("surf", endpoint, params, payload)
+    ttl = _env_int("HF_TTL_" + endpoint.upper().replace("-", "_"), TTL.get(endpoint, 3600))
+    path = _cache_path(chain, ca, endpoint, key)
+    rec = {"t": round(time.time() - S.t0, 2), "provider": "surf", "endpoint": endpoint,
+           "chain": chain, "ca": ca, "key": key, "caller": _caller(),
+           "params": {k: (v[:80] + "…" if len(v) > 80 else v) for k, v in params.items()},
+           "payload_sha": hashlib.sha1(payload.encode()).hexdigest()[:12] if payload else None,
+           "est_credits": price, "price_src": price_src}
+    if payload:
+        _d = re.findall(r"block_date\s*(>=|<=|<|>|=|BETWEEN)\s*(?:toDate\()?'?(\d{4}-\d{2}-\d{2}|today\(\)\s*-\s*\d+)", payload, re.I)
+        if _d:
+            rec["window"] = sorted({f"{op}{v}" for op, v in _d})[:4]
+        _t = re.findall(r"agent\.([a-z0-9_]+)", payload)
+        if _t:
+            rec["tables"] = sorted(set(_t))[:4]
+        if os.environ.get("HF_LEDGER_SQL") == "1":
+            rec["sql"] = payload[:1500]
+
+    with _LOCK:
+        kl = _KEY_LOCKS.setdefault(key, threading.Lock())
+    with kl:
+        # 1. cache
+        if S.cache_on:
+            hit = _cache_get(path, ttl)
+            if hit is None and endpoint == "token-holders":
+                hit = _holders_superset(chain, ca, params, ttl)
+            if hit is not None:
+                rec.update(outcome="cache_hit", credits=0)
+                _record(rec)
+                return _completed(argv, kwargs, 0, hit["stdout"], "")
+        # 2. breaker
+        if S.breaker_on and S.breaker_tripped:
+            rec.update(outcome="breaker_skip", credits=0)
+            _record(rec)
+            rc, out = S.breaker_tripped
+            return _completed(argv, kwargs, rc, out, "")
+        # 3. budget
+        if S.budget_on and S.mode in ("live", "count"):
+            # count mode applies the same budget to *planned* calls so a
+            # dry-run shows exactly what a live run would refuse.
+            spent = S.credits_actual + S.credits_reserved + (S.credits_est if S.mode == "count" else 0)
+            n_paid = S.paid_sent if S.mode == "live" else len(S.planned_keys)
+            _would_dedup = S.mode == "count" and key in S.planned_keys
+            # Brief-critical callers (72h transfers, holders/chip split, LP,
+            # insider realization) may dip into a reserve so a tight budget
+            # cuts the optional detectors first, never the brief's fields.
+            crit = any(c in rec["caller"] for c in _BRIEF_CRITICAL)
+            cap_c = S.max_credits + (S.reserve if crit else 0)
+            cap_n = S.max_calls + (S.reserve // 4 if crit else 0)
+            if not _would_dedup and (n_paid + 1 > cap_n or spent + price > cap_c):
+                if not S.budget_logged:
+                    S.budget_logged = True
+                    _log(f"BUDGET STOP: paid_calls={n_paid}/{S.max_calls} "
+                         f"credits={spent:.0f}/{S.max_credits} — refusing further paid calls "
+                         f"(fields that need them render as UNKNOWN). Raise with --max-credits.")
+                rec.update(outcome="budget_refused", credits=0)
+                _record(rec)
+                body = json.dumps({"error": {"code": "HF_BUDGET_EXCEEDED",
+                                             "message": "per-run credit budget exhausted"}}, indent=2)
+                return _completed(argv, kwargs, 4, body, "")
+        # 4. dry-run / emulation
+        if S.mode == "count":
+            data = {} if endpoint in ("project-detail",) else []
+            body = json.dumps({"data": data, "meta": {"credits_used": 0, "cached": False,
+                                                      "hf_dry_run": True}})
+            # in-run dedupe preview: a key (or a token-holders superset)
+            # already planned in this run would be a cache hit live.
+            hk = (chain, ca, params.get("include"))
+            dup = key in S.planned_keys or (
+                endpoint == "token-holders" and S.cache_on
+                and params.get("offset", "0") in ("0", "")
+                and S.planned_holders.get(hk, -1) >= int(params.get("limit", "20") or 20))
+            if dup and S.cache_on:
+                rec.update(outcome="planned_dedup", credits=0)
+                _record(rec)
+                return _completed(argv, kwargs, 0, body, "")
+            S.planned_keys.add(key)
+            if endpoint == "token-holders":
+                S.planned_holders[hk] = max(S.planned_holders.get(hk, -1),
+                                            int(params.get("limit", "20") or 20))
+            S.credits_est += price
+            rec.update(outcome="planned", credits=0)
+            _record(rec)
+            if os.environ.get("HF_CACHE_SEED_SYNTHETIC") == "1" and S.cache_on:
+                # TEST ONLY (throwaway HF_CACHE_DIR): persist the synthetic
+                # answer so a 2nd dry-run proves cache keys are stable.
+                _cache_put(path, {"ts": time.time(), "endpoint": endpoint, "chain": chain,
+                                  "ca": ca, "params": params, "stdout": body, "synthetic": True})
+            return _completed(argv, kwargs, 0, body, "")
+        if S.mode == "emulate_zero_balance":
+            S.paid_sent += 1
+            rec.update(outcome="emulated_402", credits=0)
+            _record(rec)
+            body = json.dumps({"error": {"code": "PAID_BALANCE_ZERO",
+                                         "message": "insufficient credit"}}, indent=2)
+            if S.breaker_on and not S.breaker_tripped:
+                S.breaker_tripped = (4, body)
+                _log("credit circuit OPEN (PAID_BALANCE_ZERO) — remaining paid calls skipped")
+            return _completed(argv, kwargs, 4, body, "")
+        # 5. live
+        S.paid_sent += 1
+        with _LOCK:
+            S.credits_reserved += price
+        t = time.perf_counter()
+        try:
+            proc = _REAL_RUN(argv, **kwargs)
+        except subprocess.TimeoutExpired:
+            rec.update(outcome="timeout", credits=0, secs=round(time.perf_counter() - t, 2))
+            _record(rec)
+            raise
+        finally:
+            with _LOCK:
+                S.credits_reserved -= price
+        out = proc.stdout if isinstance(proc.stdout, str) else (proc.stdout or b"").decode("utf-8", "replace")
+        err = proc.stderr if isinstance(proc.stderr, str) else (proc.stderr or b"").decode("utf-8", "replace")
+        doc = _is_ok_json(out) if proc.returncode == 0 else None
+        credits = 0.0
+        if doc is not None and isinstance(doc, dict):
+            try:
+                credits = float((doc.get("meta") or {}).get("credits_used") or 0)
+            except Exception:
+                credits = 0.0
+        S.credits_actual += credits
+        rec.update(outcome="ok" if doc is not None else "error", rc=proc.returncode,
+                   credits=credits, secs=round(time.perf_counter() - t, 2),
+                   err=None if doc is not None else (out + err)[:160])
+        _record(rec)
+        if doc is not None and S.cache_on:
+            _cache_put(path, {"ts": time.time(), "endpoint": endpoint, "chain": chain, "ca": ca,
+                              "params": params, "stdout": out})
+        elif doc is None and S.breaker_on and any(m in (out + err) for m in _ERR_BREAKER):
+            if not S.breaker_tripped:
+                S.breaker_tripped = (proc.returncode or 4, out or err)
+                _log(f"credit circuit OPEN after {S.paid_sent} paid call(s): "
+                     f"{(out + err).strip()[:120]!r} — remaining paid calls skipped (no retries)")
+        return proc
+
+
+def _holders_superset(chain, ca, params, ttl):
+    """Serve token-holders limit=N offset=0 from a cached limit>=N response."""
+    try:
+        want = int(params.get("limit", "20"))
+        if params.get("offset", "0") not in ("0", ""):
+            return None
+        d = S.cache_root / chain / ca / "token-holders"
+        if not d.is_dir():
+            return None
+        for f in d.glob("*.json"):
+            c = _cache_get(f, ttl)
+            if not c:
+                continue
+            cp = c.get("params") or {}
+            if cp.get("include") != params.get("include") or cp.get("offset", "0") not in ("0", ""):
+                continue
+            if int(cp.get("limit", "20")) >= want:
+                doc = json.loads(c["stdout"])
+                doc["data"] = (doc.get("data") or [])[:want]
+                if isinstance(doc.get("meta"), dict):
+                    doc["meta"]["limit"] = want
+                return {"stdout": json.dumps(doc, ensure_ascii=False)}
+    except Exception:
+        return None
+    return None
+
+
+def _handle_curl(argv, kwargs):
+    _u = " ".join(str(a) for a in argv)
+    if re.search(r"asksurf\.ai/[^ ]*(v1/responses|/chat|research)", _u, re.I) and os.environ.get("HF_ALLOW_ANY_SURF") != "1":
+        _log("DATA-API GUARD: refused curl to a Surf research/chat URL (0 credits)")
+        return _completed(argv, kwargs, 2, "", "refused by HertzFlow data-API guard: research/chat URL\n")
+    url = next((a for a in argv if isinstance(a, str) and a.startswith("http")), "")
+    data = None
+    for i, a in enumerate(argv):
+        if a in ("-d", "--data", "--data-raw", "--data-binary") and i + 1 < len(argv):
+            data = argv[i + 1]
+    ttl = FREE_RPC_TTL if data else 0
+    for host, t in FREE_TTL:
+        if host in url:
+            ttl = t
+            break
+    if os.environ.get("HF_FREE_TTL"):
+        ttl = _env_int("HF_FREE_TTL", ttl)
+    host = re.sub(r"^https?://([^/]+).*$", r"\1", url)
+    key = _key("curl", url, {}, _canon_payload(data or ""))
+    m = _HEX40.search(url) or (_HEX40.search(data) if data else None)
+    ca = m.group(0).lower() if m else "_any"
+    path = S.cache_root / "_free" / host / f"{key}.json"
+    method = None
+    if data:
+        try:
+            method = json.loads(data).get("method")
+        except Exception:
+            method = None
+    rec = {"t": round(time.time() - S.t0, 2), "provider": "free", "endpoint": host,
+           "url": url[:160], "rpc_method": method, "ca": ca, "caller": _caller(),
+           "est_credits": 0}
+    with _LOCK:
+        kl = _KEY_LOCKS.setdefault(key, threading.Lock())
+    with kl:
+        if S.cache_on and ttl:
+            hit = _cache_get(path, ttl)
+            if hit is not None:
+                rec.update(outcome="cache_hit")
+                _record(rec)
+                return _completed(argv, kwargs, 0, hit["stdout"], "")
+        if S.offline:
+            rec.update(outcome="offline_skip")
+            _record(rec)
+            return _completed(argv, kwargs, 7, "", "curl: (7) offline mode")
+        t = time.perf_counter()
+        try:
+            proc = _REAL_RUN(argv, **kwargs)
+        except subprocess.TimeoutExpired:
+            rec.update(outcome="timeout", secs=round(time.perf_counter() - t, 2))
+            _record(rec)
+            raise
+        out = proc.stdout if isinstance(proc.stdout, str) else (proc.stdout or b"").decode("utf-8", "replace")
+        ok = proc.returncode == 0 and out.strip() != ""
+        rpc_err = False
+        if ok:
+            # Only JSON bodies are cacheable: `curl -sS` exits 0 on HTTP 429,
+            # e.g. DexScreener/Cloudflare "error code: 1015" — never cache it.
+            try:
+                _j = json.loads(out)
+                rpc_err = bool(data) and isinstance(_j, dict) and "error" in _j
+            except Exception:
+                rpc_err = "bscscan.com/address" not in url   # HTML probe is fine
+        rec.update(outcome="ok" if ok and not rpc_err else "error", rc=proc.returncode,
+                   secs=round(time.perf_counter() - t, 2), bytes=len(out))
+        _record(rec)
+        if ok and not rpc_err and S.cache_on and ttl:
+            _cache_put(path, {"ts": time.time(), "url": url, "stdout": out})
+        return proc
+
+
+def _wrapped_run(*popenargs, **kwargs):
+    argv = popenargs[0] if popenargs else kwargs.get("args")
+    if isinstance(argv, (list, tuple)) and argv:
+        prog = os.path.basename(str(argv[0]))
+        if prog == "surf":
+            return _handle_surf(list(argv), kwargs)
+        if prog == "curl":
+            return _handle_curl(list(argv), kwargs)
+    return _REAL_RUN(*popenargs, **kwargs)
+
+
+def _wrap_urlopen():
+    import urllib.request as ur
+    real = ur.urlopen
+
+    def urlopen(req, *a, **kw):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        rec = {"t": round(time.time() - S.t0, 2), "provider": "free",
+               "endpoint": re.sub(r"^https?://([^/]+).*$", r"\1", url), "url": url[:160],
+               "caller": _caller(), "est_credits": 0}
+        if S.offline:
+            rec.update(outcome="offline_skip")
+            _record(rec)
+            raise OSError("HF_OFFLINE: network disabled")
+        rec.update(outcome="sent(urllib)")
+        _record(rec)
+        return real(req, *a, **kw)
+    ur.urlopen = urlopen
+
+
+def summary() -> dict:
+    by: dict[str, dict] = {}
+    for r in S.records:
+        k = f'{r["provider"]}:{r["endpoint"]}'
+        b = by.setdefault(k, {"calls": 0, "sent": 0, "cache_hit": 0, "breaker_skip": 0,
+                              "budget_refused": 0, "planned": 0, "errors": 0,
+                              "credits_actual": 0.0, "credits_est_if_billed": 0,
+                              "callers": {}})
+        b["calls"] += 1
+        o = r.get("outcome")
+        if o in ("ok", "error", "timeout", "emulated_402", "sent(urllib)"):
+            b["sent"] += 1
+            if r["provider"] == "surf":
+                b["credits_est_if_billed"] += r.get("est_credits", 0)
+        if o == "error" or o == "emulated_402" or o == "timeout":
+            b["errors"] += 1
+        if o in b:
+            b[o] += 1
+        if o == "planned":
+            b["credits_est_if_billed"] += r.get("est_credits", 0)
+        if o == "planned_dedup":
+            b["cache_hit"] += 1
+        b["credits_actual"] += float(r.get("credits") or 0)
+        b["callers"][r.get("caller", "?")] = b["callers"].get(r.get("caller", "?"), 0) + 1
+    tot = {
+        "mode": S.mode, "cache": S.cache_on, "breaker": S.breaker_on, "budget": S.budget_on,
+        "max_credits": S.max_credits, "max_paid_calls": S.max_calls,
+        "paid_calls_total": sum(v["calls"] for k, v in by.items() if k.startswith("surf:")),
+        "paid_calls_sent": sum(v["sent"] for k, v in by.items() if k.startswith("surf:")),
+        "paid_cache_hits": sum(v["cache_hit"] for k, v in by.items() if k.startswith("surf:")),
+        "paid_planned": sum(v["planned"] for k, v in by.items() if k.startswith("surf:")),
+        "free_calls_total": sum(v["calls"] for k, v in by.items() if k.startswith("free:")),
+        "free_calls_sent": sum(v["sent"] for k, v in by.items() if k.startswith("free:")),
+        "credits_actual": S.credits_actual,
+        "credits_est_if_billed": sum(v["credits_est_if_billed"] for v in by.values()),
+        "breaker_tripped": bool(S.breaker_tripped),
+        "wall_s": round(time.time() - S.t0, 1),
+    }
+    return {"totals": tot, "by_endpoint": by}
+
+
+def _at_exit():
+    try:
+        s = summary()
+        t = s["totals"]
+        if S.run_dir:
+            (S.run_dir / "api_summary.json").write_text(json.dumps(s, indent=2), encoding="utf-8")
+        _log(f"RUN TOTAL mode={t['mode']} paid: {t['paid_calls_total']} requested / "
+             f"{t['paid_calls_sent']} sent / {t['paid_cache_hits']} cache-hit / "
+             f"{t['paid_planned']} planned(dry-run) | credits actual={t['credits_actual']:.0f} "
+             f"est_if_billed={t['credits_est_if_billed']} (budget {t['max_credits']}) | "
+             f"free: {t['free_calls_total']} ({t['free_calls_sent']} sent) | "
+             f"breaker={'OPEN' if t['breaker_tripped'] else 'closed'}")
+        if S.mode == "count" or os.environ.get("HF_PRINT_PLAN") == "1":
+            for k, v in sorted(s["by_endpoint"].items()):
+                _log(f"  {k:<40} calls={v['calls']:<4} sent={v['sent']:<4} hit={v['cache_hit']:<4} "
+                     f"planned={v['planned']:<4} est_credits={v['credits_est_if_billed']}")
+    except Exception as e:  # never break the pipeline
+        print(f"[api_gateway] summary failed: {e}", file=sys.stderr)
+
+
+def install(run_dir: str | os.PathLike | None = None) -> bool:
+    """Idempotent. Returns True when the gateway is active."""
+    global _INSTALLED, S
+    if os.environ.get("HF_GATEWAY", "on").lower() == "off":
+        return False
+    if _INSTALLED:
+        if run_dir and S is not None and S.run_dir != Path(run_dir):
+            S.run_dir = Path(run_dir)
+            try:
+                S.run_dir.mkdir(parents=True, exist_ok=True)
+                with (S.run_dir / "api_ledger.jsonl").open("w", encoding="utf-8") as fh:
+                    for r in S.records:
+                        fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
+        return True
+    S = _State()
+    if run_dir:
+        S.run_dir = Path(run_dir)
+    if S.run_dir:
+        try:
+            S.run_dir.mkdir(parents=True, exist_ok=True)
+            (S.run_dir / "api_ledger.jsonl").write_text("", encoding="utf-8")
+        except Exception:
+            pass
+    subprocess.run = _wrapped_run
+    _wrap_urlopen()
+    atexit.register(_at_exit)
+    _INSTALLED = True
+    _log(f"active mode={S.mode} cache={'on' if S.cache_on else 'off'}({S.cache_root}) "
+         f"breaker={'on' if S.breaker_on else 'off'} budget="
+         f"{f'{S.max_credits} credits/{S.max_calls} paid calls' if S.budget_on else 'off'}")
+    return True
