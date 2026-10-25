@@ -3189,6 +3189,15 @@ def main() -> int:
         for fname in mw_export["files"]:
             print(f"    {fname}", file=sys.stderr)
 
+    # Perseus fix 9: provenance manifest (mtimes are not trustworthy on the box).
+    try:
+        import run_manifest as _rm
+        _mp = _rm.write(monitoring_parent if args.out_dir else skeleton_path.parent,
+                        {"ca": ca, "mode": os.environ.get("HF_API_MODE", "live"), "status": status})
+        print(f"  manifest: {_mp}", file=sys.stderr)
+    except Exception as _e:
+        print(f"[run_manifest] failed (non-fatal): {_e}", file=sys.stderr)
+
     return 0 if status == "ok" else 1
 
 
