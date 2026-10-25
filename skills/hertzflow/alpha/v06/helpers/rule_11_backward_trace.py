@@ -553,6 +553,24 @@ def fetch_mint_event_chunked(
     return merged[:limit], summary, n_errs, n_chunks
 
 
+OUTFLOW_POST_MINT_DAYS = 14
+
+
+def outflow_window_ceiling(alpha_listing_date: str, mint_date_day: str,
+                           today: str | None = None) -> tuple[str, bool]:
+    """Perseus fix 3 (date clamp). Step 2 scans deployer outflows in
+    [trace_floor, ceiling]. Upstream used ceiling = alpha_listing_date, so a
+    token whose 0x0 mint lands AFTER the Alpha listing (fast slice reaches
+    listing+7d) got floor > ceiling → zero rows → a false "no outflows" trace.
+    Returns (ceiling, clamped): when the mint is after listing, extend the
+    ceiling to mint+14d (never past today)."""
+    if not mint_date_day or mint_date_day <= alpha_listing_date:
+        return alpha_listing_date, False
+    t = today or date.today().isoformat()
+    ext = (date.fromisoformat(mint_date_day) + timedelta(days=OUTFLOW_POST_MINT_DAYS)).isoformat()
+    return min(ext, t), True
+
+
 def _r11_transient_retry_allowed() -> bool:
     """Perseus fix 2: retry only when a retry could succeed."""
     if os.environ.get("HF_R11_RETRY", "1") == "0":
@@ -908,12 +926,17 @@ def run_backward_trace(
     )
 
     # ---------- Step 2: deployer outflows ----------
+    outflow_ceiling, outflow_ceiling_extended = outflow_window_ceiling(
+        alpha_listing_date, mint_date_day)
+    if outflow_ceiling_extended:
+        print(f"[rule_11] mint {mint_date_day} is after listing {alpha_listing_date}: "
+              f"outflow ceiling extended to {outflow_ceiling}", file=sys.stderr)
     q2 = _write_query(
         workdir, "step2_deployer_outflows",
         SQL_DEPLOYER_OUTFLOWS.format(
             ca=ca, deployer=deployer,
             date_floor=trace_floor,
-            alpha_listing_date=alpha_listing_date,
+            alpha_listing_date=outflow_ceiling,
         transfers=transfers_table(), decimals_factor=decimals_factor_str(), dex_trades=dex_trades_table()),
         max_rows=100,
     )
@@ -923,6 +946,17 @@ def run_backward_trace(
         return {"error": "Step 2 (deployer outflows) failed.", "raw": step2}
 
     outflow_rows = step2.get("data", [])
+    # Perseus fix 3: LIMIT 100 silently truncated busy deployers. Flag it so
+    # the brief says "first 100 outflows only" instead of implying complete.
+    outflows_truncated = len(outflow_rows) >= 100
+    if outflows_truncated:
+        print("[rule_11] step2 deployer outflows hit LIMIT 100 — trace is a lower bound",
+              file=sys.stderr)
+    _window_flags = {
+        "outflow_window": [trace_floor, outflow_ceiling],
+        "outflow_ceiling_extended": outflow_ceiling_extended,
+        "outflows_truncated_at_100": outflows_truncated,
+    }
     if not outflow_rows:
         return {
             "evidence_graph": evidence_graph,
@@ -939,10 +973,11 @@ def run_backward_trace(
             "n_mint_recipients": n_mint_recipients,
             "mint_lookback_days": MINT_LOOKBACK_DAYS,
             "mint_found_outside_180d": mint_found_outside_180d,
+            **_window_flags,
             "summary_text": (
                 f"Deployer {deployer[:10]}... minted {mint_amt:,.0f} tokens "
                 f"at {_ts_to_iso(mint_ts)} but had no outflows in pre-listing "
-                f"window [{trace_floor}, {alpha_listing_date}]."
+                f"window [{trace_floor}, {outflow_ceiling}]."
             ),
         }
 
@@ -1012,6 +1047,7 @@ def run_backward_trace(
             "n_mint_recipients": n_mint_recipients,
             "mint_lookback_days": MINT_LOOKBACK_DAYS,
             "mint_found_outside_180d": mint_found_outside_180d,
+            **_window_flags,
             "summary_text": (
                 f"Deployer {deployer[:10]}... minted {mint_amt:,.0f} tokens "
                 f"at {_ts_to_iso(mint_ts)}. All pre-listing outflows in window "
@@ -1641,6 +1677,7 @@ def run_backward_trace(
         "n_mint_recipients": n_mint_recipients,
         "mint_lookback_days": MINT_LOOKBACK_DAYS,
         "mint_found_outside_180d": mint_found_outside_180d,
+        **_window_flags,
         # v0.7.14: Step-4 recursion budget telemetry. recursion_truncated=True
         # means the dispersal tree was wider than MAX_PROMOTED_SUBDUMPERS and
         # only the largest chains were followed (a report should disclose this).
