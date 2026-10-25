@@ -553,6 +553,23 @@ def fetch_mint_event_chunked(
     return merged[:limit], summary, n_errs, n_chunks
 
 
+def _r11_transient_retry_allowed() -> bool:
+    """Perseus fix 2: retry only when a retry could succeed."""
+    if os.environ.get("HF_R11_RETRY", "1") == "0":
+        return False
+    if os.environ.get("HF_API_MODE", "live") != "live":
+        return False
+    try:
+        import api_gateway as _gw
+        if _gw.S is not None and _gw.S.breaker_tripped:
+            return False
+        if _gw._KEYS is not None and _gw._KEYS.exhausted():
+            return False
+    except Exception:
+        pass
+    return True
+
+
 def fetch_mint_event_with_fast_path(
     ca: str,
     listing_date: str,
@@ -612,6 +629,17 @@ def fetch_mint_event_with_fast_path(
         # hid earlier mint candidates, but SUM-merge across the FULL
         # fallback would surface those anyway).
         return fast_rows, f"fast-path hit ({fast_diag})", True
+
+    if fast_errs >= fast_n and _r11_transient_retry_allowed():
+        # Perseus fix 2: one retry of the (cheap) fast slice when the error
+        # was transient — NOT when the credit breaker is open (PBZ) or in
+        # dry-run, where a retry can only repeat the same refusal.
+        print("[rule_11] step1 fast-path all chunks errored — one transient retry", file=sys.stderr)
+        fast_rows, fast_diag, fast_errs, fast_n = fetch_mint_event_chunked(
+            ca=ca, floor=fast_floor, workdir=workdir, ceiling=fast_ceiling,
+        )
+        if fast_rows:
+            return fast_rows, f"fast-path hit after retry ({fast_diag})", True
 
     if fast_errs >= fast_n:
         # M2: every fast chunk errored. Falling back to a full 10-chunk

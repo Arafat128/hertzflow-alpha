@@ -703,7 +703,11 @@ def build_skeleton(
     # sections (anomaly_72h, liq, cross_sym, holdings, ...) continue.
     # Cross-sym whale detection in particular does NOT need deployer trace.
     if "error" in rule11:
+        # Perseus fix 2: keep WHY the trace is missing — downstream (fix 7)
+        # turns this into an explicit data gap instead of a CLEAN default.
+        _r11_err = str(rule11.get("error"))[:400]
         rule11 = {
+            "_trace_error": _r11_err,
             "deployer": None,
             "mint_evt_ref": None,
             "mint_ts": None,
