@@ -5,7 +5,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       BINANCE_ALPHA_NO_AUTO_UPDATE: "1"
-      HF_API_MODE: count          # never a live Surf call in CI (no keys configured)
       HF_RPC_OFFLINE: "1"
     steps:
       - uses: actions/checkout@v4
