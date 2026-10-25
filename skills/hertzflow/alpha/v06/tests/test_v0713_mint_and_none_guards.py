@@ -785,7 +785,10 @@ class TestMintFastPath:
         assert ok is False
         assert rows == []
         assert "all chunks errored" in diag and "skip fallback" in diag
-        assert len(calls) == 1, "fallback must be skipped when fast all errors"
+        # Perseus fix 2: at most ONE transient retry of the same fast window;
+        # the wide fallback is still never paid for.
+        assert 1 <= len(calls) <= 2 and len(set(calls)) == 1, \
+            "fallback must be skipped when fast all errors"
 
     def test_fallback_all_error_returns_not_ok(self, monkeypatch, tmp_path):
         """Fast clean miss but fallback fully errors → ok=False (do NOT
