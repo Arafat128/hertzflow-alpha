@@ -2975,6 +2975,15 @@ def main() -> int:
 
     # Set lang BEFORE build_skeleton() so all helpers using t() see correct lang.
     sys.path.insert(0, str(Path(__file__).parent / "helpers"))
+    # Perseus fix 4: UTC+06 clock prefix on every stderr line + timing.json.
+    try:
+        import tslog as _tslog
+        _tslog.install_stderr()
+        _timeline = _tslog.Timeline()
+        print(f"[run] start {_tslog.now_str()} (Asia/Dhaka)", file=sys.stderr, flush=True)
+    except Exception as _e:
+        _tslog = _timeline = None
+        print(f"[tslog] disabled: {_e}", file=sys.stderr)
     try:
         import api_gateway as _api_gateway
         _api_gateway.install()
@@ -3098,6 +3107,15 @@ def main() -> int:
     for k, v in timings.items():
         print(f"    {k}: {v:.1f}s", file=sys.stderr)
     print(f"  wrote: {skeleton_path} ({len(payload)} bytes)", file=sys.stderr)
+    if _timeline is not None:
+        try:
+            for k, v in timings.items():
+                _timeline.mark(k, v)
+            _timeline.mark("_surf_credits", None, **(skeleton.get("_surf_credits") or {}))
+            _timeline.write(skeleton_path.parent / "timing.json")
+            print(f"  timing: {skeleton_path.parent / 'timing.json'}", file=sys.stderr)
+        except Exception as _e:
+            print(f"[tslog] timing.json failed: {_e}", file=sys.stderr)
 
     # v0.6.0-beta.3: monitoring_wallets multi-format export. Original v0.4.8
     # deliverable that v0.6 重写 dropped. v0.6.1 emits 2 files under
