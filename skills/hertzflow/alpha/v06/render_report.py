@@ -2477,6 +2477,11 @@ def _derive_chain_state_neutral_5tier(data: dict) -> dict:
     where subtype ∈ {CLEAN, WATCH, OPERATOR_DUMPED, DORMANT_INSIDER_RISK,
     RECENT_DISTRIBUTION}.
     """
+    if data.get("_no_data"):
+        # Perseus fix 7: no paid data → never derive CLEAN from empty inputs.
+        return {"subtype": "UNKNOWN",
+                "label": data.get("chain_state_label") or "UNKNOWN — data gap",
+                "risk": 0}
     lineage = data.get("lineage") or {}
     m6 = lineage.get("m6") or {}
     m6_quiet = m6.get("n_quiet") or 0

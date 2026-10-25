@@ -2831,6 +2831,53 @@ def build_skeleton(
         import sys as _sys
         print(f"[surf_credit_accounting] failed (non-fatal): {_e}", file=_sys.stderr)
 
+    # Perseus fix 7: explicit data gaps. With 0 successful paid calls or an
+    # open credit breaker, chain_state=CLEAN / risk 0 is a DEFAULT, not a
+    # measurement ($BR, $R2). Mark it UNKNOWN in the skeleton itself so no
+    # writer/template can print CLEAN by accident.
+    try:
+        apply_data_gaps(skeleton, rule11)
+    except Exception as _e:
+        import sys as _sys
+        print(f"[data_gaps] failed (non-fatal): {_e}", file=_sys.stderr)
+
+    return skeleton
+
+
+def apply_data_gaps(skeleton: dict, rule11: dict | None) -> dict:
+    gaps = []
+    sc = skeleton.get("_surf_credits") or {}
+    breaker = False
+    try:
+        import api_gateway as _gw
+        breaker = bool(_gw.S is not None and _gw.S.breaker_tripped)
+    except Exception:
+        pass
+    mode = os.environ.get("HF_API_MODE", "live")
+    if breaker:
+        gaps.append({"section": "*", "reason": "credit breaker open (PAID_BALANCE_ZERO / budget)"})
+    if sc and int(sc.get("successful_calls") or 0) == 0:
+        gaps.append({"section": "*", "reason": ("dry-run: no paid calls sent" if mode != "live"
+                                                 else "0 successful paid Surf calls")})
+    if rule11 and rule11.get("_trace_error"):
+        gaps.append({"section": "rule_11", "reason": rule11["_trace_error"][:200]})
+    if rule11 and rule11.get("outflows_truncated_at_100"):
+        gaps.append({"section": "rule_11", "reason": "deployer outflows truncated at 100 rows (lower bound)"})
+    dw = (skeleton.get("meta") or {}).get("decimals_warning")
+    if dw:
+        gaps.append({"section": "decimals", "reason": dw})
+    skeleton["_data_gaps"] = gaps
+    no_data = any(g["section"] == "*" for g in gaps)
+    skeleton["_no_data"] = no_data
+    if no_data:
+        skeleton["chain_state_measured"] = False
+        skeleton["chain_state_default_was"] = skeleton.get("chain_state")
+        skeleton["chain_state"] = "UNKNOWN"
+        skeleton["chain_state_label"] = "UNKNOWN — data gap: " + "; ".join(
+            g["reason"] for g in gaps if g["section"] == "*")
+        skeleton["chain_state_risk_score"] = None
+    else:
+        skeleton["chain_state_measured"] = True
     return skeleton
 
 
