@@ -500,21 +500,98 @@ class _KeyPool:
 _KEYS: _KeyPool | None = None
 
 
+# ---------------------------------------------------------------------------
+# Perseus fork fix 1 (2026-10-26): persistent key ledger + 0-credit preflight.
+# Surf exposes no 0-credit balance endpoint (checked surf 1.0.9 list-operations
+# and docs 2026-10-26), so health is learned reactively: every
+# PAID_BALANCE_ZERO is written to a ledger keyed by key NAME + a short sha256
+# fingerprint of the value (never the value). On the next run those keys are
+# pre-retired, and if the whole pool is known-empty the pipeline aborts BEFORE
+# any paid call instead of producing a thin all-UNKNOWN brief ($BR / $R2).
+# A new key value (top-up via new key) changes the fingerprint → auto-reset.
+# TTL: HF_KEY_LEDGER_TTL_H (default 24h). Reset: scripts/key_health.py --reset.
+def _key_fp(value: str) -> str:
+    import hashlib
+    return hashlib.sha256((value or "").encode()).hexdigest()[:12]
+
+
+def _ledger_path() -> Path:
+    p = os.environ.get("HF_KEY_LEDGER")
+    if p:
+        return Path(p)
+    return Path(os.environ.get("HF_CACHE_DIR", "/workspace/hertzflow-cache")) / "key_ledger.json"
+
+
+def load_ledger() -> dict:
+    try:
+        return json.loads(_ledger_path().read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_ledger(d: dict) -> None:
+    try:
+        p = _ledger_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d, indent=1, sort_keys=True), encoding="utf-8")
+        tmp.replace(p)
+    except Exception as e:
+        _log(f"key ledger: write failed ({e})")
+
+
+def record_pbz(name: str, value: str) -> None:
+    d = load_ledger()
+    d[name] = {"state": "PAID_BALANCE_ZERO", "fp": _key_fp(value), "ts": int(time.time())}
+    save_ledger(d)
+
+
+def ledger_dead(name: str, value: str, ledger: dict | None = None) -> bool:
+    e = (ledger if ledger is not None else load_ledger()).get(name)
+    if not e or e.get("fp") != _key_fp(value):
+        return False
+    ttl = _env_int("HF_KEY_LEDGER_TTL_H", 24) * 3600
+    return (time.time() - float(e.get("ts", 0))) < ttl
+
+
+def preflight() -> tuple[bool, str]:
+    """0-credit health check. (ok, message). Never prints key values."""
+    if _KEYS is None:
+        return True, "gateway keys not initialised"
+    if not _KEYS.pool:
+        return True, "no SURF_API_KEY_4..11 pool — surf's own key resolution"
+    alive = [n for n, _ in _KEYS.pool if n not in _KEYS.dead]
+    if not alive:
+        return False, (f"all {len(_KEYS.pool)} pool keys answered PAID_BALANCE_ZERO within "
+                       f"{_env_int('HF_KEY_LEDGER_TTL_H', 24)}h (ledger {_ledger_path()}) — top up or "
+                       f"reset with scripts/key_health.py --reset NAME")
+    return True, f"{len(alive)}/{len(_KEYS.pool)} pool keys not known-empty: {', '.join(alive)}"
+
+
 def _init_keys():
     global _KEYS
     _KEYS = _KeyPool()
     if not _KEYS.pool:
         _log("key pool: SURF_API_KEY_4..11 not set — using surf's own key resolution")
         return
+    _led = load_ledger()
+    _pre = [n for n, v in _KEYS.pool if ledger_dead(n, v, _led)]
+    for n in _pre:
+        _KEYS.retire(n)
+    if _pre:
+        _log(f"key pool: pre-retired {len(_pre)} known-empty key(s) from ledger: {', '.join(_pre)}")
+    if _KEYS.exhausted():
+        _log("key pool: every pool key is known-empty (ledger) — preflight will refuse a live run")
+        return
     cur = os.environ.get("SURF_API_KEY", "")
-    if cur and _KEYS.start_at(cur):
+    if cur and _KEYS.start_at(cur) and _KEYS.current() and _KEYS.current()[1] == cur:
         _log(f"key pool: {len(_KEYS.pool)} keys; starting at {_KEYS.current()[0]}")
     elif cur and os.environ.get("HF_KEEP_SURF_API_KEY") == "1":
         _KEYS.pool = []
         _log("key pool: HF_KEEP_SURF_API_KEY=1 — keeping the SURF_API_KEY env override, rotation off")
         return
     else:
-        if cur:
+        if cur and not any(v == cur for _, v in _KEYS.pool):
             _log("key pool: SURF_API_KEY env override is not one of SURF_API_KEY_4..11 — "
                  "ignoring it (set HF_KEEP_SURF_API_KEY=1 to keep it)")
     n, v = _KEYS.current()
@@ -726,6 +803,7 @@ def _live_call(argv, kwargs, endpoint, payload_raw, rec):
                     pass
         if rc != 0 and key and _is_pbz(out + err):
             _KEYS.retire(key[0])
+            record_pbz(key[0], key[1])
             nxt = _KEYS.current()
             if nxt is not None and tried < len(_KEYS.pool):
                 tried += 1

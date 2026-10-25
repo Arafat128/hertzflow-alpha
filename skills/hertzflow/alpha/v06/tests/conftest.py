@@ -7,6 +7,7 @@ for _k in list(os.environ):
     if _k.startswith(("SURF_API_KEY", "ARKHAM")):
         del os.environ[_k]
 os.environ["BINANCE_ALPHA_NO_AUTO_UPDATE"] = "1"
+os.environ["HF_KEY_LEDGER"] = os.path.join(tempfile.mkdtemp(prefix="hf-ledger-"), "key_ledger.json")
 _d = tempfile.mkdtemp(prefix="hf-fakebin-")
 _f = os.path.join(_d, "surf")
 with open(_f, "w") as fh:

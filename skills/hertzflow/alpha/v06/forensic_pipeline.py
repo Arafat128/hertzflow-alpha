@@ -3048,6 +3048,16 @@ def main() -> int:
     # final assembled skeleton is written to skeleton.json as before.
     if _api_gateway is not None:
         _api_gateway.install(skeleton_path.parent)   # ledger → <run>/.work/
+        # Perseus fix 1: 0-credit key preflight. Abort a LIVE run when every
+        # pool key is known-empty, instead of writing an all-UNKNOWN brief.
+        try:
+            _ok, _msg = _api_gateway.preflight()
+        except Exception as _e:
+            _ok, _msg = True, f"preflight error (ignored): {_e}"
+        print(f"[api_gateway] PREFLIGHT {'OK' if _ok else 'ABORT'}: {_msg}", file=sys.stderr, flush=True)
+        if not _ok and os.environ.get("HF_API_MODE", "live") == "live" \
+                and os.environ.get("HF_PREFLIGHT", "1") != "0":
+            return 3
     partial_path = skeleton_path.parent / "skeleton_partial.json"
     # audit HIGH#3: clear any stale checkpoint from a prior interrupted
     # run so the file `_last_section_completed` always reflects the CURRENT

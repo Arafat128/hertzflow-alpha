@@ -83,6 +83,10 @@ class T(unittest.TestCase):
 
     def setUp(self):
         gw.S.breaker_tripped = None
+        try:
+            os.remove(gw._ledger_path())   # fix 1 ledger must not leak between tests
+        except OSError:
+            pass
         os.environ["SURF_API_KEY"] = "fake-stray-override"
         gw._init_keys()
 
